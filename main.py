@@ -10,7 +10,7 @@ from pydantic import BaseModel
 import requests
 
 APP_NAME="Tairon Offerte"
-VERSION="1.1.0-live"
+VERSION="1.1.1-live"
 ROOT=Path(__file__).resolve().parent
 DB_PATH=ROOT/"tairon_offerte.db"
 
@@ -35,6 +35,16 @@ def init_db():
     for s in statements: con.execute(s)
     defaults={'auto_enabled':'1','min_discount':'30','min_score':'75','scan_seconds':'900','source_filter':'all','region':'Lombardia'}
     for k,v in defaults.items(): con.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",(k,v))
+    con.commit(); con.close()
+
+def cleanup_demo_rows():
+    if DEMO_MODE: return
+    ids=('amz-sony','amz-ssd','ess-rummo-lom','conad-rummo-cam','coop-caffe-ven','amz-oled','amz-airfryer')
+    con=connect()
+    marks=','.join('?' for _ in ids)
+    con.execute(f"DELETE FROM prices WHERE product_id IN ({marks})",ids)
+    con.execute(f"DELETE FROM alert_events WHERE product_id IN ({marks})",ids)
+    con.execute(f"DELETE FROM products WHERE id IN ({marks})",ids)
     con.commit(); con.close()
 
 def settings_dict(con): return {r['key']:r['value'] for r in con.execute("SELECT key,value FROM settings")}
