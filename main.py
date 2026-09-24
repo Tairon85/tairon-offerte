@@ -331,6 +331,7 @@ async def scan_once():
     real_rows=await asyncio.to_thread(fetch_amazon_deals,terms)
     await asyncio.to_thread(fetch_esselunga_promotions)
     rows=list(real_rows)
+    rows.extend(SUPERMARKET_OFFERS)
     if DEMO_MODE:
         for d in DEMO:
             rows.append({**d,'price':round(d['offer']*(1+random.uniform(-0.01,0.01)),2),'live_source':'demo'})
@@ -341,7 +342,7 @@ async def scan_once():
         p={**d,'price':price}
         con.execute("INSERT INTO products(id,title,brand,source_type,retailer,region,unit,url,image_url) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET title=excluded.title,brand=excluded.brand,source_type=excluded.source_type,retailer=excluded.retailer,region=excluded.region,unit=excluded.unit,url=excluded.url,image_url=excluded.image_url",(p['id'],p['title'],p.get('brand'),p['source_type'],p['retailer'],p.get('region'),p.get('unit'),p.get('url'),p.get('image_url')))
         hist=[float(r['price']) for r in con.execute("SELECT price FROM prices WHERE product_id=? ORDER BY id DESC LIMIT 180",(p['id'],))]
-        baseline=float(d.get('base') or price)
+        baseline=float(d.get('original_price') or d.get('base') or price)
         # Local history becomes increasingly important over time; first observation can use Amazon saving basis.
         m=calc_metrics(hist,price,baseline)
         if p['id'].startswith('amazon-') and not hist and baseline>0:
