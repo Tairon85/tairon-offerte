@@ -40,13 +40,13 @@ def calc_metrics(history,current,original):
     return {'avg':round(avg,2),'min':round(min_hist,2),'discount_pct':round(discount,1),'vs_avg_pct':round(vs_avg,1),'score':score}
 
 DEMO=[
- {'id':'amz-sony','title':'Sony WH-1000XM6','brand':'Sony','source_type':'online','retailer':'Amazon','region':None,'unit':'pz','base':50.0,'offer':10.0,'url':'https://www.amazon.it/'},
- {'id':'amz-ssd','title':'SSD NVMe 2TB PCIe 4.0','brand':'Generic','source_type':'online','retailer':'Amazon','region':None,'unit':'pz','base':169.9,'offer':109.9,'url':'https://www.amazon.it/'},
+ {'id':'amz-sony','title':'Sony WH-1000XM6','brand':'Sony','source_type':'online','retailer':'Amazon','region':None,'unit':'pz','base':50.0,'offer':10.0,'url':'https://www.amazon.it/s?k=Sony+WH-1000XM6'},
+ {'id':'amz-ssd','title':'SSD NVMe 2TB PCIe 4.0','brand':'Generic','source_type':'online','retailer':'Amazon','region':None,'unit':'pz','base':169.9,'offer':109.9,'url':'https://www.amazon.it/s?k=SSD+NVMe+2TB+PCIe+4.0'},
  {'id':'ess-rummo-lom','title':'Pasta Rummo 500 g','brand':'Rummo','source_type':'market','retailer':'Esselunga','region':'Lombardia','unit':'500 g','base':2.0,'offer':0.80,'url':'https://www.esselunga.it/'},
  {'id':'conad-rummo-cam','title':'Pasta Rummo 500 g','brand':'Rummo','source_type':'market','retailer':'Conad','region':'Campania','unit':'500 g','base':1.95,'offer':0.89,'url':'https://www.conad.it/'},
  {'id':'coop-caffe-ven','title':'Caffè macinato 250 g','brand':'Demo','source_type':'market','retailer':'Coop','region':'Veneto','unit':'250 g','base':4.79,'offer':2.69,'url':'https://www.coop.it/'},
- {'id':'amz-oled','title':'TV OLED 55 pollici 4K','brand':'Samsung','source_type':'online','retailer':'Amazon','region':None,'unit':'pz','base':1199.0,'offer':749.0,'url':'https://www.amazon.it/'},
- {'id':'amz-airfryer','title':'Air Fryer 8L Dual Zone','brand':'Demo','source_type':'online','retailer':'Amazon','region':None,'unit':'pz','base':179.99,'offer':99.99,'url':'https://www.amazon.it/'}]
+ {'id':'amz-oled','title':'TV OLED 55 pollici 4K','brand':'Samsung','source_type':'online','retailer':'Amazon','region':None,'unit':'pz','base':1199.0,'offer':749.0,'url':'https://www.amazon.it/s?k=Samsung+OLED+55+4K'},
+ {'id':'amz-airfryer','title':'Air Fryer 8L Dual Zone','brand':'Demo','source_type':'online','retailer':'Amazon','region':None,'unit':'pz','base':179.99,'offer':99.99,'url':'https://www.amazon.it/s?k=Air+Fryer+8L+Dual+Zone'}]
 
 def emit(con,p,m,kind,suffix=''):
     msg=f"{p['retailer']}: {p['title']} a {p['price']:.2f} € · -{m['discount_pct']:.0f}% · Score {m['score']}{suffix}"
