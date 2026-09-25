@@ -13,7 +13,7 @@ import requests
 from pypdf import PdfReader
 
 APP_NAME="Tairon Offerte"
-VERSION="1.3.0-live"
+VERSION="1.3.1-live"
 ROOT=Path(__file__).resolve().parent
 DB_PATH=ROOT/"tairon_offerte.db"
 
@@ -280,148 +280,324 @@ def _extract_offer_rows_from_pdf(pdf_bytes,pdf_url,validity=''):
     print(f'[ESSELUNGA] marker_sconto={total_markers} offerte_estratte={len(rows)} url={pdf_url}')
     return rows[:80]
 
-def _find_pdf_url(target_url):
-    """Trova e scarica il PDF del volantino Esselunga partendo da pagina/redirect/asset."""
-    headers={
+def _esselunga_headers():
+    return {
         "User-Agent":"Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 Safari/604.1",
         "Accept-Language":"it-IT,it;q=0.9,en;q=0.5",
-        "Accept":"text/html,application/xhtml+xml,application/pdf;q=0.9,*/*;q=0.8",
+        "Accept":"text/html,application/xhtml+xml,application/json,text/plain,application/pdf;q=0.9,*/*;q=0.8",
     }
-    print(f"[ESSELUNGA] PDF_DISCOVERY target={target_url}")
 
-    r=requests.get(target_url,timeout=25,headers=headers,allow_redirects=True)
+
+def _extract_offer_rows_from_text(raw_text, source_url, validity=''):
+    """Estrae offerte Esselunga da testo HTML/JSON/JS del volantino digitale."""
+    import hashlib
+
+    def clean(s):
+        s=html_lib.unescape(s or '')
+        s=re.sub(r'<script\b.*?</script>',' ',s,flags=re.I|re.S)
+        s=re.sub(r'<style\b.*?</style>',' ',s,flags=re.I|re.S)
+        s=re.sub(r'<[^>]+>','\n',s)
+        s=s.replace('\\/','/').replace('\\n','\n').replace('\\t',' ')
+        s=re.sub(r'[\r\f\v]+','\n',s)
+        s=re.sub(r'[ \t]+',' ',s)
+        s=re.sub(r'\n{3,}','\n\n',s)
+        return s
+
+    def price_values(s):
+        out=[]
+        for pat in (
+            r'€\s*(\d{1,4}[,.]\d{2})',
+            r'(\d{1,4}[,.]\d{2})\s*€',
+            r'\b(\d{1,3}[,.]\d{2})\b',
+        ):
+            for m in re.finditer(pat,s,flags=re.I):
+                try:
+                    v=float(m.group(1).replace('.','').replace(',','.')) if ',' in m.group(1) else float(m.group(1))
+                    if 0.01<=v<=9999 and v not in out:
+                        out.append(round(v,2))
+                except Exception:
+                    pass
+        return out
+
+    def find_discount(s):
+        for pat in (
+            r'SCONTO\s+FIDATY\s*-?\s*(\d{1,2})\s*%',
+            r'SCONTO\s*-?\s*(\d{1,2})\s*%',
+            r'-\s*(\d{1,2})\s*%',
+            r'(\d{1,2})\s*%\s+(?:DI\s+)?SCONTO',
+        ):
+            m=re.search(pat,s,flags=re.I)
+            if m:
+                try:
+                    p=int(m.group(1))
+                    if 1<=p<=90:
+                        return p
+                except Exception:
+                    pass
+        return None
+
+    def title_score(line):
+        t=re.sub(r'\s+',' ',line or '').strip(' -·|')
+        if len(t)<4 or len(t)>110:
+            return -100
+        up=t.upper()
+        bad=(
+            'SCONTO','FIDATY','OFFERTA','PREZZO','RISPARMIO','VALIDO',
+            'DAL ','FINO AL','AL KG','AL LITRO','AL PZ','€','EUR',
+            'VOLANTINO','ESSLUNGA','ESSELUNGA','COOKIE','PRIVACY'
+        )
+        if any(x in up for x in bad):
+            return -50
+        letters=sum(c.isalpha() for c in t)
+        if letters<4:
+            return -50
+        return letters - sum(c.isdigit() for c in t)
+
+    txt=clean(raw_text)
+    lines=[re.sub(r'\s+',' ',x).strip() for x in txt.splitlines() if re.sub(r'\s+',' ',x).strip()]
+    rows=[]
+    seen=set()
+
+    # Cerca marker di sconto in una finestra locale; funziona anche se l'HTML
+    # separa titolo/prezzo/sconto su nodi diversi.
+    for i,line in enumerate(lines):
+        discount=find_discount(line)
+        if not discount:
+            continue
+
+        a=max(0,i-12)
+        b=min(len(lines),i+13)
+        window=lines[a:b]
+        joined=' '.join(window)
+        prices=price_values(joined)
+        if not prices:
+            continue
+
+        title_candidates=sorted(window,key=title_score,reverse=True)
+        title=next((x for x in title_candidates if title_score(x)>0),None)
+        if not title:
+            continue
+
+        title=re.sub(r'€?\s*\d{1,4}[,.]\d{2}\s*€?','',title)
+        title=re.sub(r'\s+',' ',title).strip(' -·|')
+        if len(title)<4:
+            continue
+
+        offer=min(prices)
+        original=max(prices) if len(prices)>=2 else None
+        if original is not None and original<=offer:
+            original=None
+
+        if original is None and discount:
+            try:
+                est=round(offer/(1-discount/100),2)
+                if est>offer:
+                    original=est
+            except Exception:
+                pass
+
+        key=(title.lower(),offer,discount)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        raw_id=f'{title}|{offer}|{discount}|{source_url}'
+        rows.append({
+            'id':'esselunga-'+hashlib.sha1(raw_id.encode('utf-8')).hexdigest()[:16],
+            'title':title.title() if title.isupper() else title,
+            'retailer':'Esselunga',
+            'region':ESSELUNGA_REGION,
+            'price':round(offer,2),
+            'original_price':round(original,2) if original else None,
+            'discount_pct':discount,
+            'validity':validity,
+            'url':source_url,
+            'page':None,
+            'source_type':'market'
+        })
+
+    print(f"[ESSELUNGA] TEXT_EXTRACT url={source_url} lines={len(lines)} offers={len(rows)}")
+    return rows[:80]
+
+
+def _discover_flipbook_urls(page_text, base_url):
+    urls=[]
+
+    def add(v):
+        if not v:
+            return
+        v=html_lib.unescape(v).replace('\\/','/').strip().strip('"\' ')
+        if v.startswith('//'):
+            v='https:'+v
+        u=urljoin(base_url,v)
+        if u not in urls:
+            urls.append(u)
+
+    for pat in (
+        r'(?:href|src|data-href|data-src|data-url|content)=["\']([^"\']+)["\']',
+        r'["\']([^"\']*(?:/cdn/volantini/|index\.html|config|manifest|pages|search)[^"\']*)["\']',
+    ):
+        for m in re.finditer(pat,page_text or '',flags=re.I):
+            v=m.group(1)
+            lv=v.lower()
+            if any(k in lv for k in (
+                '/cdn/volantini/','index.html','config','manifest',
+                'pages','search','data.','content.'
+            )):
+                add(v)
+    return urls
+
+
+def _extract_offer_rows_from_flipbook(viewer_url, validity=''):
+    """Legge flipbook Esselunga senza browser/OCR: HTML + JS/JSON/text layer."""
+    headers=_esselunga_headers()
+    rows=[]
+    visited=set()
+    queue=[viewer_url]
+    text_assets=[]
+
+    # Limiti stretti: niente crawl infinito e scansione manuale più veloce.
+    while queue and len(visited)<14:
+        u=queue.pop(0)
+        if u in visited:
+            continue
+        visited.add(u)
+        try:
+            r=requests.get(u,timeout=12,headers=headers,allow_redirects=True)
+        except Exception as e:
+            print(f"[ESSELUNGA] FLIP_FETCH_ERROR url={u} error={str(e)[:140]}")
+            continue
+
+        ctype=(r.headers.get('content-type') or '').lower()
+        print(
+            f"[ESSELUNGA] FLIP_FETCH status={r.status_code} "
+            f"type={ctype[:55]} bytes={len(r.content)} url={r.url}"
+        )
+        if not r.ok:
+            continue
+
+        # Se per caso il viewer espone un PDF, usa il parser già esistente.
+        if 'application/pdf' in ctype or r.content[:4]==b'%PDF':
+            try:
+                got=_extract_offer_rows_from_pdf(r.content,r.url,validity)
+                if got:
+                    return got
+            except Exception as e:
+                print(f"[ESSELUNGA] FLIP_PDF_ERROR {str(e)[:140]}")
+            continue
+
+        if not any(x in ctype for x in ('text/','json','javascript','xml')) and len(r.content)>2500000:
+            continue
+
+        body=r.text or ''
+
+        # Prima prova direttamente il testo del documento/asset.
+        got=_extract_offer_rows_from_text(body,r.url,validity)
+        if got:
+            rows.extend(got)
+            if len(rows)>=20:
+                break
+
+        # Scopri altri asset solo se sono verosimilmente testuali/config.
+        for child in _discover_flipbook_urls(body,r.url):
+            lc=child.lower()
+            if any(ext in lc for ext in (
+                '.js','.json','.xml','.txt','.html','.htm','config','manifest',
+                'search','pages','content','data'
+            )) and child not in visited and child not in queue:
+                queue.append(child)
+
+        # Ricorda URL immagini solo come diagnostica: niente OCR.
+        for m in re.finditer(
+            r'["\']([^"\']+\.(?:jpg|jpeg|png|webp)(?:\?[^"\']*)?)["\']',
+            body,flags=re.I
+        ):
+            img=urljoin(r.url,html_lib.unescape(m.group(1)).replace('\\/','/'))
+            if img not in text_assets:
+                text_assets.append(img)
+
+    # Dedup finale
+    out=[]
+    keys=set()
+    for x in rows:
+        k=(x['title'].lower(),x['price'],x['discount_pct'])
+        if k in keys:
+            continue
+        keys.add(k)
+        out.append(x)
+
     print(
-        f"[ESSELUNGA] PDF_DISCOVERY page_status={r.status_code} "
-        f"final_url={r.url} content_type={(r.headers.get('content-type') or '')[:80]} "
-        f"bytes={len(r.content)}"
+        f"[ESSELUNGA] FLIP_DONE viewer={viewer_url} "
+        f"visited={len(visited)} images_seen={len(text_assets)} offers={len(out)}"
     )
-    r.raise_for_status()
+    return out[:80]
+
+
+def _extract_esselunga_target(target_url, validity=''):
+    """Prova PDF, HTML digitale e flipbook CDN, in quest'ordine."""
+    headers=_esselunga_headers()
+    try:
+        r=requests.get(target_url,timeout=12,headers=headers,allow_redirects=True)
+    except Exception as e:
+        print(f"[ESSELUNGA] TARGET_FETCH_ERROR url={target_url} error={str(e)[:160]}")
+        return [],None
 
     ctype=(r.headers.get('content-type') or '').lower()
     final_url=r.url or target_url
-
-    if 'application/pdf' in ctype or final_url.lower().split('?',1)[0].endswith('.pdf'):
-        print(f"[ESSELUNGA] PDF_FOUND direct url={final_url} bytes={len(r.content)}")
-        return final_url,r.content
-
-    page=r.text or ''
-    candidates=[]
-
-    def add_candidate(value):
-        if not value:
-            return
-        value=html_lib.unescape(value)
-        value=value.replace('\\/','/').replace('\\u002F','/').replace('\\u002f','/')
-        value=value.replace('&amp;','&').strip().strip('"\' ')
-        if value.startswith('//'):
-            value='https:'+value
-        full=urljoin(final_url,value)
-        if full not in candidates:
-            candidates.append(full)
-
-    # URL PDF espliciti, inclusi JSON/JS escapati.
-    for m in re.finditer(r'https?:\\?/\\?/[^"\'\s<>]+?\.pdf(?:\?[^"\'\s<>]*)?',page,flags=re.I):
-        add_candidate(m.group(0).replace('\\/','/'))
-
-    for m in re.finditer(r'(?:"|\')([^"\']+?\.pdf(?:\?[^"\']*)?)(?:"|\')',page,flags=re.I):
-        add_candidate(m.group(1))
-
-    # Link/iframe/source/data-* che possono portare alla pagina del volantino.
-    secondary=[]
-    for pat in (
-        r'(?:href|src|data-href|data-src|data-url|content)=["\']([^"\']+)["\']',
-        r'["\'](https?:\\?/\\?/[^"\']*(?:volantin|flyer|leaflet|catalog)[^"\']*)["\']',
-    ):
-        for m in re.finditer(pat,page,flags=re.I):
-            v=html_lib.unescape(m.group(1)).replace('\\/','/')
-            if any(k in v.lower() for k in ('volantin','flyer','leaflet','catalog','promozion')):
-                full=urljoin(final_url,v)
-                if full not in secondary and full!=final_url:
-                    secondary.append(full)
-
     print(
-        f"[ESSELUNGA] PDF_DISCOVERY pdf_candidates={len(candidates)} "
-        f"secondary_candidates={len(secondary)}"
+        f"[ESSELUNGA] TARGET status={r.status_code} type={ctype[:65]} "
+        f"bytes={len(r.content)} url={final_url}"
     )
+    if not r.ok:
+        return [],None
 
-    # Prova tutti i PDF trovati, non solo il primo.
-    for pdf_url in candidates[:20]:
+    if 'application/pdf' in ctype or r.content[:4]==b'%PDF':
         try:
-            pr=requests.get(pdf_url,timeout=30,headers=headers,allow_redirects=True)
-            pct=(pr.headers.get('content-type') or '').lower()
-            is_pdf=('application/pdf' in pct or pr.url.lower().split('?',1)[0].endswith('.pdf')
-                    or pr.content[:4]==b'%PDF')
-            print(
-                f"[ESSELUNGA] PDF_TRY status={pr.status_code} pdf={is_pdf} "
-                f"bytes={len(pr.content)} url={pr.url}"
-            )
-            if pr.ok and is_pdf and len(pr.content)>1000:
-                print(f"[ESSELUNGA] PDF_FOUND url={pr.url} bytes={len(pr.content)}")
-                return pr.url,pr.content
+            return _extract_offer_rows_from_pdf(r.content,final_url,validity),'pdf'
         except Exception as e:
-            print(f"[ESSELUNGA] PDF_TRY_ERROR url={pdf_url} error={str(e)[:180]}")
+            print(f"[ESSELUNGA] TARGET_PDF_ERROR {str(e)[:160]}")
+            return [],'pdf'
 
-    # Se la prima pagina rimanda a un viewer/landing, esploralo di un livello.
-    for second_url in secondary[:12]:
-        try:
-            sr=requests.get(second_url,timeout=25,headers=headers,allow_redirects=True)
-            sct=(sr.headers.get('content-type') or '').lower()
-            print(
-                f"[ESSELUNGA] SECONDARY status={sr.status_code} "
-                f"content_type={sct[:70]} bytes={len(sr.content)} url={sr.url}"
-            )
-            if not sr.ok:
-                continue
-            if 'application/pdf' in sct or sr.content[:4]==b'%PDF':
-                print(f"[ESSELUNGA] PDF_FOUND secondary_direct url={sr.url} bytes={len(sr.content)}")
-                return sr.url,sr.content
+    body=r.text or ''
 
-            spage=sr.text or ''
-            nested=[]
-            for m in re.finditer(r'https?:\\?/\\?/[^"\'\s<>]+?\.pdf(?:\?[^"\'\s<>]*)?',spage,flags=re.I):
-                u=m.group(0).replace('\\/','/')
-                u=html_lib.unescape(u)
-                if u not in nested: nested.append(u)
-            for m in re.finditer(r'(?:"|\')([^"\']+?\.pdf(?:\?[^"\']*)?)(?:"|\')',spage,flags=re.I):
-                u=urljoin(sr.url,html_lib.unescape(m.group(1)).replace('\\/','/'))
-                if u not in nested: nested.append(u)
+    # 1) Le pagine "volantino-digitale" Esselunga spesso contengono già
+    # testo/JSON utile nel markup.
+    direct=_extract_offer_rows_from_text(body,final_url,validity)
+    if direct:
+        return direct,'html'
 
-            print(f"[ESSELUNGA] SECONDARY nested_pdf_candidates={len(nested)}")
-            for pdf_url in nested[:12]:
-                try:
-                    pr=requests.get(pdf_url,timeout=30,headers=headers,allow_redirects=True)
-                    pct=(pr.headers.get('content-type') or '').lower()
-                    is_pdf=('application/pdf' in pct or pr.content[:4]==b'%PDF')
-                    print(
-                        f"[ESSELUNGA] NESTED_PDF_TRY status={pr.status_code} pdf={is_pdf} "
-                        f"bytes={len(pr.content)} url={pr.url}"
-                    )
-                    if pr.ok and is_pdf and len(pr.content)>1000:
-                        print(f"[ESSELUNGA] PDF_FOUND nested url={pr.url} bytes={len(pr.content)}")
-                        return pr.url,pr.content
-                except Exception as e:
-                    print(f"[ESSELUNGA] NESTED_PDF_ERROR url={pdf_url} error={str(e)[:180]}")
-        except Exception as e:
-            print(f"[ESSELUNGA] SECONDARY_ERROR url={second_url} error={str(e)[:180]}")
+    # 2) Cerca il viewer CDN del flipbook.
+    viewers=[
+        u for u in _discover_flipbook_urls(body,final_url)
+        if '/cdn/volantini/' in u.lower() or u.lower().endswith('/index.html')
+    ]
+    print(f"[ESSELUNGA] VIEWERS count={len(viewers)} target={final_url}")
 
-    print(f"[ESSELUNGA] PDF_NOT_FOUND target={target_url}")
-    return None,None
+    for viewer in viewers[:3]:
+        got=_extract_offer_rows_from_flipbook(viewer,validity)
+        if got:
+            return got,'flipbook'
+
+    # Se il target stesso è già il viewer CDN.
+    if '/cdn/volantini/' in final_url.lower():
+        got=_extract_offer_rows_from_flipbook(final_url,validity)
+        if got:
+            return got,'flipbook'
+
+    return [],'html'
 
 
 def fetch_esselunga_promotions():
-    """Legge campagne Esselunga, scopre il PDF e ne estrae le singole offerte."""
+    """Legge campagne Esselunga e offerte da pagina digitale/flipbook/PDF."""
     global SUPERMARKET_PROMOTIONS,SUPERMARKET_OFFERS
     try:
-        headers={
-            "User-Agent":"Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 Safari/604.1",
-            "Accept-Language":"it-IT,it;q=0.9",
-        }
+        headers=_esselunga_headers()
         print(
             f"[ESSELUNGA] START page={ESSELUNGA_PAGE} "
             f"store={ESSELUNGA_STORE_CODE} region={ESSELUNGA_REGION}"
         )
 
-        r=requests.get(ESSELUNGA_PAGE,timeout=20,headers=headers,allow_redirects=True)
+        r=requests.get(ESSELUNGA_PAGE,timeout=12,headers=headers,allow_redirects=True)
         print(
             f"[ESSELUNGA] LANDING status={r.status_code} final_url={r.url} "
             f"bytes={len(r.content)}"
@@ -437,27 +613,34 @@ def fetch_esselunga_promotions():
             title=_plain_html(m.group(1))
             if not title or 'PROMOZIONI' in title.upper() or title.lower().startswith('seleziona un negozio'):
                 continue
+
             end=matches[i+1].start() if i+1<len(matches) else min(len(page),m.end()+8000)
             chunk=page[m.end():end]
             txt=_plain_html(chunk)
+
             dm=re.search(
                 r'((?:Dal|Fino al)\s+.{3,120}?)(?=(?:Sfoglia|Scopri|Altri|Novit|Ultimo|In arrivo|$))',
                 txt,flags=re.I
             )
             validity=re.sub(r'\s+',' ',dm.group(1)).strip(' ·-') if dm else ''
+
             hrefs=[
-                urljoin(r.url,h)
+                urljoin(r.url,html_lib.unescape(h).replace('\\/','/'))
                 for h in re.findall(
                     r'(?:href|src|data-href|data-src|data-url)=["\']([^"\']+)["\']',
                     chunk,flags=re.I
                 )
             ]
-            flyer=next((h for h in hrefs if 'volantin' in h.lower()),None)
+
+            # Priorità alla pagina digitale, poi al viewer/volantino generico.
+            digital=next((h for h in hrefs if 'volantino-digitale' in h.lower()),None)
+            flyer=next((h for h in hrefs if 'volantino.' in h.lower() or '/cdn/volantini/' in h.lower()),None)
             discover=next(
                 (h for h in hrefs if any(k in h.lower() for k in ('offerte','promo','flyer','leaflet'))),
                 None
             )
-            href=flyer or discover or (hrefs[0] if hrefs else r.url)
+            href=digital or flyer or discover or (hrefs[0] if hrefs else r.url)
+
             found.append({
                 'id':f"esselunga-{ESSELUNGA_STORE_CODE}-{len(found)+1}",
                 'title':title,
@@ -466,33 +649,9 @@ def fetch_esselunga_promotions():
                 'validity':validity,
                 'url':href,
                 'flyer_url':flyer,
-                'offers_url':discover,
+                'offers_url':digital or discover,
                 'store_code':ESSELUNGA_STORE_CODE
             })
-
-        # Fallback: se gli h3 cambiano struttura, usa direttamente i link volantino/promo della pagina.
-        if not found:
-            raw_links=[]
-            for m in re.finditer(
-                r'(?:href|src|data-href|data-src|data-url)=["\']([^"\']+)["\']',
-                page,flags=re.I
-            ):
-                u=urljoin(r.url,html_lib.unescape(m.group(1)).replace('\\/','/'))
-                if any(k in u.lower() for k in ('volantin','offerte','promo','flyer','leaflet')):
-                    if u not in raw_links: raw_links.append(u)
-            for u in raw_links[:20]:
-                found.append({
-                    'id':f"esselunga-{ESSELUNGA_STORE_CODE}-{len(found)+1}",
-                    'title':'Volantino Esselunga',
-                    'retailer':'Esselunga',
-                    'region':ESSELUNGA_REGION,
-                    'validity':'',
-                    'url':u,
-                    'flyer_url':u,
-                    'offers_url':None,
-                    'store_code':ESSELUNGA_STORE_CODE
-                })
-            print(f"[ESSELUNGA] FALLBACK_LINKS count={len(raw_links)}")
 
         seen=set()
         out=[]
@@ -507,15 +666,15 @@ def fetch_esselunga_promotions():
         print(f"[ESSELUNGA] CAMPAIGNS count={len(SUPERMARKET_PROMOTIONS)}")
 
         offers=[]
-        pdf_found=0
+        sources_ok=0
 
-        for idx,promo in enumerate(SUPERMARKET_PROMOTIONS[:12],start=1):
+        # Limita le campagne da analizzare per evitare il timeout del POST /scan/now.
+        for idx,promo in enumerate(SUPERMARKET_PROMOTIONS[:6],start=1):
             targets=[]
             for candidate in (
-                promo.get('flyer_url'),
                 promo.get('offers_url'),
+                promo.get('flyer_url'),
                 promo.get('url'),
-                ESSELUNGA_PAGE,
             ):
                 if candidate and candidate not in targets:
                     targets.append(candidate)
@@ -525,49 +684,27 @@ def fetch_esselunga_promotions():
                 f"targets={len(targets)}"
             )
 
-            campaign_pdf=None
-            campaign_bytes=None
+            campaign_rows=[]
+            source_kind=None
+            for target in targets[:2]:
+                got,kind=_extract_esselunga_target(target,promo.get('validity',''))
+                if got:
+                    campaign_rows=got
+                    source_kind=kind
+                    break
 
-            for target in targets:
-                try:
-                    pdf_url,pdf_bytes=_find_pdf_url(target)
-                    if pdf_url and pdf_bytes:
-                        campaign_pdf=pdf_url
-                        campaign_bytes=pdf_bytes
-                        break
-                except Exception as pe:
-                    print(
-                        f"[ESSELUNGA] DISCOVERY_ERROR campaign={idx} "
-                        f"target={target} error={str(pe)[:180]}"
-                    )
-
-            if campaign_pdf and campaign_bytes:
-                pdf_found+=1
-                promo['pdf_url']=campaign_pdf
+            if campaign_rows:
+                sources_ok+=1
+                promo['offer_source']=source_kind
+                promo['offers_count']=len(campaign_rows)
+                offers.extend(campaign_rows)
                 print(
-                    f"[ESSELUNGA] EXTRACT_START campaign={idx} "
-                    f"bytes={len(campaign_bytes)} pdf={campaign_pdf}"
+                    f"[ESSELUNGA] CAMPAIGN_DONE index={idx} "
+                    f"source={source_kind} offers={len(campaign_rows)}"
                 )
-                try:
-                    extracted=_extract_offer_rows_from_pdf(
-                        campaign_bytes,
-                        campaign_pdf,
-                        promo.get('validity','')
-                    )
-                    print(
-                        f"[ESSELUNGA] EXTRACT_DONE campaign={idx} "
-                        f"offers={len(extracted)}"
-                    )
-                    offers.extend(extracted)
-                except Exception as pe:
-                    promo['extract_error']=str(pe)[:160]
-                    print(
-                        f"[ESSELUNGA] EXTRACT_ERROR campaign={idx} "
-                        f"error={str(pe)[:180]}"
-                    )
             else:
-                promo['extract_error']='PDF non trovato'
-                print(f"[ESSELUNGA] CAMPAIGN_NO_PDF index={idx}")
+                promo['extract_error']='Nessuna offerta testuale trovata nel volantino digitale'
+                print(f"[ESSELUNGA] CAMPAIGN_EMPTY index={idx}")
 
         dedup=[]
         keys=set()
@@ -583,15 +720,15 @@ def fetch_esselunga_promotions():
             configured=True,
             live=True,
             last_ok=now_iso(),
-            last_error=None if pdf_found else "Nessun PDF Esselunga trovato",
+            last_error=None if SUPERMARKET_OFFERS else "Volantini trovati ma nessuna offerta testuale estratta",
             items=len(SUPERMARKET_OFFERS),
             campaigns=len(SUPERMARKET_PROMOTIONS),
-            pdfs=pdf_found,
+            offer_sources=sources_ok,
         )
 
         print(
             f"[ESSELUNGA] DONE campaigns={len(SUPERMARKET_PROMOTIONS)} "
-            f"pdfs={pdf_found} offers={len(SUPERMARKET_OFFERS)}"
+            f"sources_ok={sources_ok} offers={len(SUPERMARKET_OFFERS)}"
         )
         return SUPERMARKET_PROMOTIONS
 
