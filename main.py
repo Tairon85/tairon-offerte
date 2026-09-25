@@ -13,7 +13,7 @@ import requests
 from pypdf import PdfReader
 
 APP_NAME="Tairon Offerte"
-VERSION="1.3.6-live"
+VERSION="1.3.7-live"
 ROOT=Path(__file__).resolve().parent
 DB_PATH=ROOT/"tairon_offerte.db"
 
@@ -614,25 +614,105 @@ def _discover_flipbook_urls(page_text, base_url):
 
 
 def _flipbook_probe_urls(viewer_url):
-    """Genera nomi comuni di config/data usati dai viewer statici."""
+    """Asset reali individuati nel formato FlippingBook usato da Esselunga."""
     base=viewer_url.rsplit('/',1)[0] + '/'
     names=[
-        'config.js','settings.js','data.js','pages.js','manifest.json',
-        'config.json','data.json','pages.json','bookConfig.json',
-        'book_config.json','search.json','searchtext.js','search_config.js',
-        'javascript/config.js','javascript/settings.js','javascript/data.js',
-        'javascript/pages.js','javascript/search_config.js',
-        'js/config.js','js/settings.js','js/data.js','js/pages.js',
-        'js/search.js','data/config.json','data/pages.json','data/search.json',
-        'search/searchtext.js','search/search_config.js','search/search.json',
-        'files/assets/basic-html/page1.html','files/assets/search/searchtext.js',
+        'files/html/polyfills.js',
+        'files/html/build.js',
+        'files/assets/cover300.jpg',
+        'files/assets/html/skin/images/fbThumb.jpg',
+        'files/html/assets/pages/pagestub.png',
     ]
     return [urljoin(base,n) for n in names]
 
 
-def _extract_offer_rows_from_flipbook(viewer_url, validity=''):
-    """Legge il viewer Esselunga seguendo davvero i suoi asset interni."""
+def _extract_svg_visible_text(svg_text):
+    """Recupera eventuale testo/accessibility metadata presente nei vector layer SVG."""
+    s=html_lib.unescape(svg_text or '')
+    # testo tra tag SVG + title/desc/aria-label
+    chunks=[]
+    for m in re.finditer(r'<(?:text|tspan|title|desc)\b[^>]*>(.*?)</(?:text|tspan|title|desc)>',s,flags=re.I|re.S):
+        v=re.sub(r'<[^>]+>',' ',m.group(1))
+        v=re.sub(r'\s+',' ',html_lib.unescape(v)).strip()
+        if v: chunks.append(v)
+    for m in re.finditer(r'(?:aria-label|data-text|alt)=["\']([^"\']+)["\']',s,flags=re.I):
+        v=re.sub(r'\s+',' ',html_lib.unescape(m.group(1))).strip()
+        if v: chunks.append(v)
+    return '\n'.join(chunks)
+
+
+def _extract_flippingbook_vectorlayers(viewer_url, validity=''):
+    """Legge i page-vectorlayers del FlippingBook senza OCR."""
+    base=viewer_url.rsplit('/',1)[0] + '/'
     headers=_esselunga_headers()
+    rows=[]
+    pages_ok=0
+    misses=0
+
+    # Il formato usa 0001.svg, 0002.svg, ...
+    for page_no in range(1, 61):
+        page=f'{page_no:04d}'
+        url=urljoin(base,f'files/assets/common/page-vectorlayers/{page}.svg')
+        try:
+            r=_esselunga_get(url,timeout=4,attempts=1,headers=headers)
+        except Exception as e:
+            print(f"[ESSELUNGA] VECTOR_ERROR page={page} error={str(e)[:120]}")
+            misses += 1
+            if pages_ok and misses >= 3:
+                break
+            continue
+
+        if not r.ok:
+            misses += 1
+            if pages_ok and misses >= 3:
+                break
+            # Se le prime 4 pagine non esistono, questo viewer non usa vectorlayers.
+            if not pages_ok and page_no >= 4:
+                break
+            continue
+
+        misses=0
+        pages_ok += 1
+        body=r.text or ''
+        visible=_extract_svg_visible_text(body)
+        print(
+            f"[ESSELUNGA] VECTOR_PAGE page={page} bytes={len(r.content)} "
+            f"visible_chars={len(visible)}"
+        )
+
+        if visible:
+            got=_extract_offer_rows_from_text(visible,url,validity)
+            for x in got:
+                x['page']=page_no
+            rows.extend(got)
+
+    # deduplica
+    out=[]
+    seen=set()
+    for x in rows:
+        k=(x.get('title','').lower(),x.get('price'),x.get('original_price'))
+        if k in seen: continue
+        seen.add(k); out.append(x)
+
+    print(
+        f"[ESSELUNGA] VECTOR_DONE viewer={viewer_url} "
+        f"pages_ok={pages_ok} offers={len(out)}"
+    )
+    return out[:100]
+
+
+
+def _extract_offer_rows_from_flipbook(viewer_url, validity=''):
+    """Legge il viewer Esselunga seguendo gli asset reali del FlippingBook."""
+    headers=_esselunga_headers()
+
+    # Prima prova il layer vettoriale pagina-per-pagina: è il percorso
+    # più diretto per ottenere testo senza OCR.
+    vector_rows=_extract_flippingbook_vectorlayers(viewer_url,validity)
+    if vector_rows:
+        print(f"[ESSELUNGA] VECTOR_HANDOFF offers={len(vector_rows)}")
+        return vector_rows
+
     rows=[]
     visited=set()
     queue=[viewer_url]
@@ -645,7 +725,7 @@ def _extract_offer_rows_from_flipbook(viewer_url, validity=''):
         if u not in queue:
             queue.append(u)
 
-    while queue and len(visited)<40:
+    while queue and len(visited)<12:
         u=queue.pop(0)
         if u in visited:
             continue
@@ -1158,6 +1238,8 @@ async def scan_once():
     real_rows=await asyncio.to_thread(fetch_amazon_deals,terms)
     await asyncio.to_thread(fetch_esselunga_promotions)
     rows=list(real_rows)
+    # FIX 1.3.7: le offerte Esselunga estratte devono entrare nel DB/deals.
+    rows.extend(SUPERMARKET_OFFERS)
     if DEMO_MODE:
         for d in DEMO:
             rows.append({**d,'price':round(d['offer']*(1+random.uniform(-0.01,0.01)),2),'live_source':'demo'})
@@ -1168,7 +1250,7 @@ async def scan_once():
         p={**d,'price':price}
         con.execute("INSERT INTO products(id,title,brand,source_type,retailer,region,unit,url,image_url) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET title=excluded.title,brand=excluded.brand,source_type=excluded.source_type,retailer=excluded.retailer,region=excluded.region,unit=excluded.unit,url=excluded.url,image_url=excluded.image_url",(p['id'],p['title'],p.get('brand'),p['source_type'],p['retailer'],p.get('region'),p.get('unit'),p.get('url'),p.get('image_url')))
         hist=[float(r['price']) for r in con.execute("SELECT price FROM prices WHERE product_id=? ORDER BY id DESC LIMIT 180",(p['id'],))]
-        baseline=float(d.get('base') or price)
+        baseline=float(d.get('original_price') or d.get('base') or price)
         # Local history becomes increasingly important over time; first observation can use Amazon saving basis.
         m=calc_metrics(hist,price,baseline)
         if p['id'].startswith('amazon-') and not hist and baseline>0:
