@@ -13,7 +13,7 @@ import requests
 from pypdf import PdfReader
 
 APP_NAME="Tairon Offerte"
-VERSION="1.3.2-live"
+VERSION="1.3.3-live"
 ROOT=Path(__file__).resolve().parent
 DB_PATH=ROOT/"tairon_offerte.db"
 
@@ -479,102 +479,175 @@ def _extract_offer_rows_from_text(raw_text, source_url, validity=''):
 
 
 def _discover_flipbook_urls(page_text, base_url):
+    """Scopre asset interni del viewer: script, css, json, xml, html e data file."""
     urls=[]
 
     def add(v):
         if not v:
             return
         v=html_lib.unescape(v).replace('\\/','/').strip().strip('"\' ')
+        if not v or v.startswith(('data:','javascript:','#')):
+            return
         if v.startswith('//'):
             v='https:'+v
-        u=urljoin(base_url,v)
+        try:
+            u=urljoin(base_url,v)
+        except Exception:
+            return
         if u not in urls:
             urls.append(u)
 
-    for pat in (
-        r'(?:href|src|data-href|data-src|data-url|content)=["\']([^"\']+)["\']',
-        r'["\']([^"\']*(?:/cdn/volantini/|index\.html|config|manifest|pages|search)[^"\']*)["\']',
+    body=page_text or ''
+
+    # HTML standard: script/link/img/source/iframe/a e attributi data-*.
+    for m in re.finditer(
+        r'(?:src|href|data-src|data-href|data-url|content)=["\']([^"\']+)["\']',
+        body,flags=re.I
     ):
-        for m in re.finditer(pat,page_text or '',flags=re.I):
-            v=m.group(1)
-            lv=v.lower()
-            if any(k in lv for k in (
-                '/cdn/volantini/','index.html','config','manifest',
-                'pages','search','data.','content.'
-            )):
-                add(v)
+        add(m.group(1))
+
+    # Stringhe JS/JSON contenenti asset o path relativi.
+    for m in re.finditer(
+        r'["\']([^"\']+\.(?:js|mjs|json|xml|txt|html?|css|jpg|jpeg|png|webp)(?:\?[^"\']*)?)["\']',
+        body,flags=re.I
+    ):
+        add(m.group(1))
+
+    # Path senza estensione ma tipicamente usati dai flipbook.
+    for m in re.finditer(
+        r'["\']([^"\']*(?:config|manifest|search|pages|pagefiles|javascript|data|content)[^"\']*)["\']',
+        body,flags=re.I
+    ):
+        candidate=m.group(1)
+        if len(candidate) < 220:
+            add(candidate)
+
     return urls
 
 
+def _flipbook_probe_urls(viewer_url):
+    """Genera nomi comuni di config/data usati dai viewer statici."""
+    base=viewer_url.rsplit('/',1)[0] + '/'
+    names=[
+        'config.js','settings.js','data.js','pages.js','manifest.json',
+        'config.json','data.json','pages.json','bookConfig.json',
+        'book_config.json','search.json','searchtext.js','search_config.js',
+        'javascript/config.js','javascript/settings.js','javascript/data.js',
+        'javascript/pages.js','javascript/search_config.js',
+        'js/config.js','js/settings.js','js/data.js','js/pages.js',
+        'js/search.js','data/config.json','data/pages.json','data/search.json',
+        'search/searchtext.js','search/search_config.js','search/search.json',
+        'files/assets/basic-html/page1.html','files/assets/search/searchtext.js',
+    ]
+    return [urljoin(base,n) for n in names]
+
+
 def _extract_offer_rows_from_flipbook(viewer_url, validity=''):
-    """Legge flipbook Esselunga senza browser/OCR: HTML + JS/JSON/text layer."""
+    """Legge il viewer Esselunga seguendo davvero i suoi asset interni."""
     headers=_esselunga_headers()
     rows=[]
     visited=set()
     queue=[viewer_url]
-    text_assets=[]
+    discovered_images=[]
+    asset_hits=0
 
-    # Limiti stretti: niente crawl infinito e scansione manuale più veloce.
-    while queue and len(visited)<14:
+    # I primi probe vengono aggiunti subito, così non dipendiamo dai nomi
+    # presenti nell'index.html.
+    for u in _flipbook_probe_urls(viewer_url):
+        if u not in queue:
+            queue.append(u)
+
+    while queue and len(visited)<40:
         u=queue.pop(0)
         if u in visited:
             continue
         visited.add(u)
+
         try:
-            r=_esselunga_get(u,timeout=5,attempts=2,headers=headers)
+            r=_esselunga_get(u,timeout=5,attempts=1,headers=headers)
         except Exception as e:
-            print(f"[ESSELUNGA] FLIP_FETCH_ERROR url={u} error={str(e)[:140]}")
+            print(f"[ESSELUNGA] ASSET_FETCH_ERROR url={u} error={str(e)[:140]}")
             continue
 
-        ctype=(r.headers.get('content-type') or '').lower()
-        print(
-            f"[ESSELUNGA] FLIP_FETCH status={r.status_code} "
-            f"type={ctype[:55]} bytes={len(r.content)} url={r.url}"
-        )
         if not r.ok:
             continue
 
-        # Se per caso il viewer espone un PDF, usa il parser già esistente.
+        ctype=(r.headers.get('content-type') or '').lower()
+        final=r.url or u
+
+        print(
+            f"[ESSELUNGA] ASSET_FETCH status={r.status_code} "
+            f"type={ctype[:55]} bytes={len(r.content)} url={final}"
+        )
+
         if 'application/pdf' in ctype or r.content[:4]==b'%PDF':
             try:
-                got=_extract_offer_rows_from_pdf(r.content,r.url,validity)
+                got=_extract_offer_rows_from_pdf(r.content,final,validity)
                 if got:
+                    print(f"[ESSELUNGA] ASSET_PDF_OFFERS count={len(got)}")
                     return got
             except Exception as e:
-                print(f"[ESSELUNGA] FLIP_PDF_ERROR {str(e)[:140]}")
+                print(f"[ESSELUNGA] ASSET_PDF_ERROR {str(e)[:140]}")
             continue
 
-        if not any(x in ctype for x in ('text/','json','javascript','xml')) and len(r.content)>2500000:
+        is_text=(
+            any(x in ctype for x in ('text/','json','javascript','xml'))
+            or final.lower().split('?',1)[0].endswith(
+                ('.js','.mjs','.json','.xml','.txt','.html','.htm','.css')
+            )
+        )
+        if not is_text:
+            if final.lower().split('?',1)[0].endswith(('.jpg','.jpeg','.png','.webp')):
+                if final not in discovered_images:
+                    discovered_images.append(final)
             continue
 
-        body=r.text or ''
+        try:
+            body=r.text or ''
+        except Exception:
+            continue
 
-        # Prima prova direttamente il testo del documento/asset.
-        got=_extract_offer_rows_from_text(body,r.url,validity)
+        asset_hits+=1
+
+        got=_extract_offer_rows_from_text(body,final,validity)
         if got:
             rows.extend(got)
-            if len(rows)>=20:
+            print(
+                f"[ESSELUNGA] ASSET_TEXT_OFFERS url={final} "
+                f"count={len(got)} total={len(rows)}"
+            )
+            if len(rows)>=30:
                 break
 
-        # Scopri altri asset solo se sono verosimilmente testuali/config.
-        for child in _discover_flipbook_urls(body,r.url):
-            lc=child.lower()
-            if any(ext in lc for ext in (
-                '.js','.json','.xml','.txt','.html','.htm','config','manifest',
-                'search','pages','content','data'
-            )) and child not in visited and child not in queue:
-                queue.append(child)
+        # Segui tutti gli asset plausibili scoperti dentro questo file.
+        for child in _discover_flipbook_urls(body,final):
+            lc=child.lower().split('?',1)[0]
 
-        # Ricorda URL immagini solo come diagnostica: niente OCR.
+            if lc.endswith(('.jpg','.jpeg','.png','.webp')):
+                if child not in discovered_images:
+                    discovered_images.append(child)
+                continue
+
+            if (
+                lc.endswith(('.js','.mjs','.json','.xml','.txt','.html','.htm','.css'))
+                or any(k in lc for k in (
+                    '/javascript/','/js/','/data/','/search/','/pages/',
+                    'config','manifest','content','pagefiles'
+                ))
+            ):
+                if child not in visited and child not in queue and len(queue)<100:
+                    queue.append(child)
+
+        # Alcuni viewer costruiscono URL senza virgolette in JS.
         for m in re.finditer(
-            r'["\']([^"\']+\.(?:jpg|jpeg|png|webp)(?:\?[^"\']*)?)["\']',
+            r'(?:(?:url|src|file|path|config|manifest|search)[\s:=]+)'
+            r'["\']?([^"\'\s,;})]+\.(?:js|json|xml|txt|html?))',
             body,flags=re.I
         ):
-            img=urljoin(r.url,html_lib.unescape(m.group(1)).replace('\\/','/'))
-            if img not in text_assets:
-                text_assets.append(img)
+            child=urljoin(final,m.group(1).replace('\\/','/'))
+            if child not in visited and child not in queue:
+                queue.append(child)
 
-    # Dedup finale
     out=[]
     keys=set()
     for x in rows:
@@ -586,10 +659,18 @@ def _extract_offer_rows_from_flipbook(viewer_url, validity=''):
 
     print(
         f"[ESSELUNGA] FLIP_DONE viewer={viewer_url} "
-        f"visited={len(visited)} images_seen={len(text_assets)} offers={len(out)}"
+        f"visited={len(visited)} text_assets={asset_hits} "
+        f"images_seen={len(discovered_images)} offers={len(out)}"
     )
-    return out[:80]
 
+    # Log utile per il prossimo passo se il viewer fosse puramente immagine.
+    if not out and discovered_images:
+        print(
+            f"[ESSELUNGA] IMAGE_ONLY_FALLBACK images={len(discovered_images)} "
+            f"sample={discovered_images[:5]}"
+        )
+
+    return out[:80]
 
 def _extract_esselunga_target(target_url, validity=''):
     """Prova PDF, HTML digitale e flipbook CDN, in quest'ordine."""
