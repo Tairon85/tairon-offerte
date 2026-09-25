@@ -20,7 +20,7 @@ except Exception:
     OCR_IMPORT_OK=False
 
 APP_NAME="Tairon Offerte"
-VERSION="1.3.10-live"
+VERSION="1.3.11-live"
 ROOT=Path(__file__).resolve().parent
 DB_PATH=ROOT/"tairon_offerte.db"
 
@@ -568,6 +568,124 @@ def _extract_offer_rows_from_text(raw_text, source_url, validity=''):
             'page':None,
             'source_type':'market'
         })
+
+
+    # FIX 1.3.11: OCR dei volantini spesso legge correttamente prodotto e prezzo
+    # ma perde il marker "SCONTO". In quel caso usa il prezzo come ancora e cerca
+    # il titolo nelle righe vicine.
+    if not rows:
+        noise_words=(
+            'ESSELUNGA','FIDATY','OFFERTA','SCONTO','PREZZO','RISPARMIO',
+            'VALIDO','DAL ','FINO AL','VOLANTINO','PUNTI','RACCOLTA',
+            'REGOLAMENTO','WWW.','HTTP','COOKIE','PRIVACY','AL KG','AL LITRO',
+            'AL PZ','CAD.','CAD ','PEZZI','GRAMMI','LITRI'
+        )
+
+        def probable_title(s):
+            t=re.sub(r'\s+',' ',s or '').strip(' -·|:;,.')
+            if len(t)<4 or len(t)>90:
+                return False
+            up=t.upper()
+            if any(w in up for w in noise_words):
+                return False
+            # scarta righe che sono quasi solo numeri/simboli
+            letters=sum(c.isalpha() for c in t)
+            digits=sum(c.isdigit() for c in t)
+            if letters < 4 or letters < digits:
+                return False
+            # scarta righe con percentuali o soli prezzi
+            if '%' in t or re.fullmatch(r'[\d\s€.,xX]+',t):
+                return False
+            return True
+
+        def local_price(line):
+            vals=price_values(line)
+            if not vals:
+                # OCR può separare euro e centesimi: "2 99", "2, 99", "2. 99"
+                m=re.search(r'\b(\d{1,3})\s*[,.\s]\s*(\d{2})\b',line)
+                if m:
+                    try:
+                        v=float(f"{int(m.group(1))}.{m.group(2)}")
+                        if 0.05 <= v <= 500:
+                            vals=[v]
+                    except Exception:
+                        pass
+            return vals
+
+        for i,line in enumerate(lines):
+            vals=local_price(line)
+            if not vals:
+                continue
+
+            # Evita date, anni e quantità improbabili.
+            vals=[v for v in vals if 0.05 <= v <= 500]
+            if not vals:
+                continue
+            offer=min(vals)
+
+            # Cerca il titolo soprattutto prima del prezzo, poi subito dopo.
+            candidates=[]
+            for j in range(max(0,i-5), min(len(lines),i+4)):
+                if j==i:
+                    continue
+                cand=lines[j]
+                if probable_title(cand):
+                    distance=abs(i-j)
+                    # Preferisci righe sopra il prezzo e vicine.
+                    score=(30 if j<i else 20) - distance*3 + min(20,sum(c.isalpha() for c in cand))
+                    candidates.append((score,cand))
+
+            if not candidates:
+                continue
+            candidates.sort(reverse=True)
+            title=candidates[0][1]
+            title=re.sub(r'\s+',' ',title).strip(' -·|:;,.')
+            if len(title)<4:
+                continue
+
+            # Cerca eventuale prezzo originale/sconto nella finestra locale.
+            a=max(0,i-5); b=min(len(lines),i+6)
+            joined=' '.join(lines[a:b])
+            prices=price_values(joined)
+            original=max(prices) if len(prices)>=2 else None
+            if original is not None and original <= offer:
+                original=None
+
+            discount=find_discount(joined)
+            if not discount and original and original>offer:
+                try:
+                    discount=round((1-offer/original)*100)
+                    if discount < 5 or discount > 90:
+                        discount=None
+                except Exception:
+                    discount=None
+
+            key=(title.lower(),round(offer,2),discount)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            raw_id=f'{title}|{offer}|{discount}|{source_url}'
+            rows.append({
+                'id':'esselunga-'+hashlib.sha1(raw_id.encode('utf-8')).hexdigest()[:16],
+                'title':title.title() if title.isupper() else title,
+                'retailer':'Esselunga',
+                'region':ESSELUNGA_REGION,
+                'price':round(offer,2),
+                'original_price':round(original,2) if original else None,
+                'discount_pct':discount,
+                'validity':validity,
+                'url':source_url,
+                'page':None,
+                'source_type':'market'
+            })
+
+        # diagnostica utile senza stampare tutto l'OCR
+        sample=[x for x in lines if probable_title(x)][:8]
+        print(
+            f"[ESSELUNGA] OCR_PRICE_FALLBACK url={source_url} "
+            f"offers={len(rows)} sample_titles={sample}"
+        )
 
     print(f"[ESSELUNGA] TEXT_EXTRACT url={source_url} lines={len(lines)} offers={len(rows)}")
     return rows[:80]
