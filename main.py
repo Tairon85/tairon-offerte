@@ -13,7 +13,7 @@ import requests
 from pypdf import PdfReader
 
 APP_NAME="Tairon Offerte"
-VERSION="1.3.5-live"
+VERSION="1.3.6-live"
 ROOT=Path(__file__).resolve().parent
 DB_PATH=ROOT/"tairon_offerte.db"
 
@@ -344,6 +344,94 @@ def _cached_esselunga_targets():
         if u and u not in out:
             out.append(u)
     return out
+
+
+def _extract_offer_rows_from_embedded_json(raw_text, source_url, validity=''):
+    import hashlib
+    body = html_lib.unescape(raw_text or '').replace('\\/','/')
+    rows, seen, candidates = [], set(), []
+
+    for m in re.finditer(r'\{[^{}]{20,1800}\}', body, flags=re.S):
+        s = m.group(0)
+        low = s.lower()
+        if not any(k in low for k in ('price','prezzo','discount','sconto','product','prodotto','description','descrizione','name','nome')):
+            continue
+        if not re.search(r'(\d+[.,]\d{2})', s):
+            continue
+        candidates.append(s)
+        if len(candidates) >= 1200:
+            break
+
+    def pick_string(s, keys):
+        for k in keys:
+            mm = re.search(rf'["\']?{k}["\']?\s*:\s*["\']([^"\']{{3,140}})["\']', s, flags=re.I)
+            if mm:
+                v = re.sub(r'<[^>]+>', ' ', mm.group(1))
+                v = re.sub(r'\s+', ' ', html_lib.unescape(v)).strip(' -|')
+                if len(v) >= 3:
+                    return v
+        return None
+
+    def pick_number(s, keys):
+        for k in keys:
+            mm = re.search(rf'["\']?{k}["\']?\s*:\s*["\']?\s*([0-9]{{1,4}}(?:[.,][0-9]{{1,2}})?)', s, flags=re.I)
+            if mm:
+                try:
+                    return float(mm.group(1).replace(',','.'))
+                except Exception:
+                    pass
+        return None
+
+    for s in candidates:
+        title = pick_string(s, ['productName','product_name','name','nome','title','titolo','description','descrizione','label'])
+        if not title:
+            continue
+        price = pick_number(s, ['promoPrice','promoprice','offerPrice','offerprice','price','prezzo','currentPrice','currentprice','sellingPrice'])
+        original = pick_number(s, ['originalPrice','originalprice','oldPrice','oldprice','listPrice','listprice','regularPrice','regularprice'])
+        discount = pick_number(s, ['discountPercent','discountpercent','discount','sconto','discountPct'])
+
+        nums = []
+        for mm in re.finditer(r'€?\s*([0-9]{1,4}[.,][0-9]{2})\s*€?', s):
+            try:
+                v = float(mm.group(1).replace(',','.'))
+                if 0.01 <= v <= 9999 and v not in nums:
+                    nums.append(v)
+            except Exception:
+                pass
+        if price is None and nums:
+            price = min(nums)
+        if original is None and len(nums) >= 2:
+            hi = max(nums)
+            if price is not None and hi > price:
+                original = hi
+
+        if price is None or price <= 0 or price > 9999:
+            continue
+        if discount is None and original and original > price:
+            discount = round((original-price)/original*100, 1)
+
+        key = (title.lower(), round(price,2), round(original or 0,2))
+        if key in seen:
+            continue
+        seen.add(key)
+
+        raw_id = f'{title}|{price}|{original}|{source_url}'
+        rows.append({
+            'id':'esselunga-'+hashlib.sha1(raw_id.encode('utf-8')).hexdigest()[:16],
+            'title':title,
+            'retailer':'Esselunga',
+            'region':ESSELUNGA_REGION,
+            'price':round(price,2),
+            'original_price':round(original,2) if original and original > price else None,
+            'discount_pct':round(float(discount),1) if discount is not None else (round((original-price)/original*100,1) if original and original > price else 0),
+            'validity':validity,
+            'url':source_url,
+            'page':None,
+            'source_type':'market'
+        })
+
+    print(f"[ESSELUNGA] JSON_EXTRACT url={source_url} candidates={len(candidates)} offers={len(rows)}")
+    return rows[:80]
 
 
 def _extract_offer_rows_from_text(raw_text, source_url, validity=''):
@@ -699,8 +787,10 @@ def _extract_esselunga_target(target_url, validity=''):
 
     body=r.text or ''
 
-    # 1) Le pagine "volantino-digitale" Esselunga spesso contengono già
-    # testo/JSON utile nel markup.
+    structured=_extract_offer_rows_from_embedded_json(body,final_url,validity)
+    if structured:
+        return structured,'embedded-json'
+
     direct=_extract_offer_rows_from_text(body,final_url,validity)
     if direct:
         return direct,'html'
@@ -1094,11 +1184,19 @@ async def scan_once():
         n+=1
     con.commit(); con.close(); return n
 
-stop_event=asyncio.Event(); scanner_task=None; manual_scan_task=None
+stop_event=asyncio.Event(); scanner_task=None; manual_scan_task=None; scan_lock=asyncio.Lock()
 async def scanner_loop():
     while not stop_event.is_set():
-        try: await scan_once()
-        except Exception as e: print('scan error',e)
+        try:
+            if not scan_lock.locked():
+                async with scan_lock:
+                    print('[SCAN] AUTO_START')
+                    await scan_once()
+                    print('[SCAN] AUTO_DONE')
+            else:
+                print('[SCAN] AUTO_SKIP already_running=true')
+        except Exception as e:
+            print('scan error',e)
         con=connect(); seconds=int(settings_dict(con).get('scan_seconds','30')); con.close()
         try: await asyncio.wait_for(stop_event.wait(),timeout=seconds)
         except asyncio.TimeoutError: pass
@@ -1213,19 +1311,21 @@ def alerts(limit:int=Query(50,ge=1,le=200),after:int=0):
 @app.post('/api/scan/now')
 async def scan_now():
     global manual_scan_task
-    if manual_scan_task and not manual_scan_task.done():
+    if scan_lock.locked():
         return {'ok':True,'started':False,'running':True,'message':'Scansione già in corso','time':now_iso()}
 
     async def _run_manual_scan():
         try:
-            print('[SCAN] MANUAL_START')
-            scanned = await scan_once()
-            print(f'[SCAN] MANUAL_DONE scanned={scanned}')
+            async with scan_lock:
+                print('[SCAN] MANUAL_START')
+                scanned = await scan_once()
+                print(f'[SCAN] MANUAL_DONE scanned={scanned}')
         except Exception as e:
             print(f'[SCAN] MANUAL_ERROR error={str(e)[:240]}')
 
     manual_scan_task = asyncio.create_task(_run_manual_scan())
     return {'ok':True,'started':True,'running':True,'message':'Scansione avviata in background','time':now_iso()}
+
 @app.get('/api/events')
 async def events():
     async def stream():
