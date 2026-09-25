@@ -20,7 +20,7 @@ except Exception:
     OCR_IMPORT_OK=False
 
 APP_NAME="Tairon Offerte"
-VERSION="1.3.9-live"
+VERSION="1.3.10-live"
 ROOT=Path(__file__).resolve().parent
 DB_PATH=ROOT/"tairon_offerte.db"
 
@@ -648,55 +648,43 @@ def _extract_svg_visible_text(svg_text):
     return '\n'.join(chunks)
 
 
-def _discover_flippingbook_substrates(viewer_url, max_pages=80):
-    """Trova le immagini pagina reali del FlippingBook."""
+def _discover_flippingbook_substrates(viewer_url, max_pages=40):
+    """Trova le pagine JPEG reali con percorso diretto e circuit breaker rete."""
     base=viewer_url.rsplit('/',1)[0] + '/'
     headers=_esselunga_headers()
     found=[]
     misses_after_found=0
+    net_errors=0
 
     for page_no in range(1,max_pages+1):
         page=f'{page_no:04d}'
-        page_hit=None
+        u=urljoin(base,f'files/assets/common/page-html5-substrates/page{page}_4.jpg')
 
-        # FlippingBook usa di solito _1.._4 in base alla risoluzione/export.
-        candidates=[
-            f'files/assets/common/page-html5-substrates/page{page}_4.jpg',
-            f'files/assets/common/page-html5-substrates/page{page}_3.jpg',
-            f'files/assets/common/page-html5-substrates/page{page}_2.jpg',
-            f'files/assets/common/page-html5-substrates/page{page}_1.jpg',
-            f'files/assets/common/page-html5-substrates/page{page}.jpg',
-            f'files/assets/common/page-substrates/page{page}.jpg',
-        ]
-
-        for rel in candidates:
-            u=urljoin(base,rel)
-            try:
-                r=_esselunga_get(u,timeout=4,attempts=1,headers=headers)
-            except Exception:
-                continue
-            if r.ok and (r.headers.get('content-type') or '').lower().startswith('image/'):
-                page_hit=u
-                print(
-                    f"[ESSELUNGA] PAGE_IMAGE page={page} bytes={len(r.content)} "
-                    f"url={u}"
-                )
+        try:
+            r=_esselunga_get(u,timeout=3,attempts=1,headers=headers)
+            net_errors=0
+        except Exception as e:
+            net_errors += 1
+            print(f"[ESSELUNGA] PAGE_NET_ERROR page={page} consecutive={net_errors} error={str(e)[:120]}")
+            if net_errors >= 2:
+                print("[ESSELUNGA] PAGE_IMAGES_ABORT reason=cdn_unreachable")
                 break
+            continue
 
-        if page_hit:
-            found.append(page_hit)
+        if r.ok and (r.headers.get('content-type') or '').lower().startswith('image/'):
+            found.append(u)
             misses_after_found=0
+            print(f"[ESSELUNGA] PAGE_IMAGE page={page} bytes={len(r.content)} url={u}")
         else:
             misses_after_found += 1
-            if found and misses_after_found >= 3:
+            if found and misses_after_found >= 2:
                 break
-            if not found and page_no >= 4:
+            if not found and page_no >= 3:
                 break
 
-    print(
-        f"[ESSELUNGA] PAGE_IMAGES_DONE viewer={viewer_url} count={len(found)}"
-    )
+    print(f"[ESSELUNGA] PAGE_IMAGES_DONE viewer={viewer_url} count={len(found)}")
     return found
+
 
 
 def _svg_diagnostics(svg_text):
@@ -713,32 +701,32 @@ def _svg_diagnostics(svg_text):
 
 
 def _extract_flippingbook_vectorlayers(viewer_url, validity=''):
-    """Legge i page-vectorlayers del FlippingBook senza OCR."""
+    """Legge i vectorlayer, ma interrompe subito se il CDN non è raggiungibile."""
     base=viewer_url.rsplit('/',1)[0] + '/'
     headers=_esselunga_headers()
     rows=[]
     pages_ok=0
+    consecutive_net_errors=0
     misses=0
 
-    # Il formato usa 0001.svg, 0002.svg, ...
-    for page_no in range(1, 61):
+    # Bastano poche pagine per capire se c'è testo utile.
+    for page_no in range(1, 13):
         page=f'{page_no:04d}'
         url=urljoin(base,f'files/assets/common/page-vectorlayers/{page}.svg')
         try:
-            r=_esselunga_get(url,timeout=4,attempts=1,headers=headers)
+            r=_esselunga_get(url,timeout=3,attempts=1,headers=headers)
+            consecutive_net_errors=0
         except Exception as e:
-            print(f"[ESSELUNGA] VECTOR_ERROR page={page} error={str(e)[:120]}")
-            misses += 1
-            if pages_ok and misses >= 3:
+            consecutive_net_errors += 1
+            print(f"[ESSELUNGA] VECTOR_NET_ERROR page={page} consecutive={consecutive_net_errors} error={str(e)[:120]}")
+            if consecutive_net_errors >= 2:
+                print("[ESSELUNGA] VECTOR_ABORT reason=cdn_unreachable")
                 break
             continue
 
         if not r.ok:
             misses += 1
-            if pages_ok and misses >= 3:
-                break
-            # Se le prime 4 pagine non esistono, questo viewer non usa vectorlayers.
-            if not pages_ok and page_no >= 4:
+            if misses >= 3:
                 break
             continue
 
@@ -759,18 +747,16 @@ def _extract_flippingbook_vectorlayers(viewer_url, validity=''):
                 x['page']=page_no
             rows.extend(got)
 
-    # deduplica
     out=[]
     seen=set()
     for x in rows:
         k=(x.get('title','').lower(),x.get('price'),x.get('original_price'))
-        if k in seen: continue
-        seen.add(k); out.append(x)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(x)
 
-    print(
-        f"[ESSELUNGA] VECTOR_DONE viewer={viewer_url} "
-        f"pages_ok={pages_ok} offers={len(out)}"
-    )
+    print(f"[ESSELUNGA] VECTOR_DONE viewer={viewer_url} pages_ok={pages_ok} offers={len(out)}")
     return out[:100]
 
 
@@ -874,18 +860,11 @@ def _ocr_flippingbook_pages(page_images, validity='', max_pages=12):
 
 
 def _extract_offer_rows_from_flipbook(viewer_url, validity=''):
-    """Legge il viewer Esselunga seguendo gli asset reali del FlippingBook."""
+    """Legge il viewer Esselunga puntando subito alle immagini reali + OCR."""
     headers=_esselunga_headers()
 
-    # Prima prova il layer vettoriale pagina-per-pagina: è il percorso
-    # più diretto per ottenere testo senza OCR.
-    vector_rows=_extract_flippingbook_vectorlayers(viewer_url,validity)
-    if vector_rows:
-        print(f"[ESSELUNGA] VECTOR_HANDOFF offers={len(vector_rows)}")
-        return vector_rows
-
-    # Se il testo è convertito in path SVG, individua almeno le vere immagini
-    # pagina del volantino. Questo rende il prossimo fallback OCR deterministico.
+    # FIX 1.3.10: sappiamo già che i vectorlayer non contengono testo utile.
+    # Proviamo subito le immagini pagina, così con rete instabile bastano 1-2 GET.
     page_images=_discover_flippingbook_substrates(viewer_url)
     if page_images:
         print(
@@ -897,6 +876,17 @@ def _extract_offer_rows_from_flipbook(viewer_url, validity=''):
         if ocr_rows:
             print(f"[ESSELUNGA] OCR_HANDOFF offers={len(ocr_rows)}")
             return ocr_rows
+
+        vector_rows=_extract_flippingbook_vectorlayers(viewer_url,validity)
+        if vector_rows:
+            print(f"[ESSELUNGA] VECTOR_HANDOFF offers={len(vector_rows)}")
+            return vector_rows
+
+    # Se non siamo riusciti neppure a leggere la prima immagine, evitare
+    # decine di timeout aggiuntivi: il prossimo ciclo riproverà.
+    if not page_images:
+        print("[ESSELUNGA] FLIP_ABORT reason=no_page_images_or_cdn_unreachable")
+        return []
 
     rows=[]
     visited=set()
