@@ -13,7 +13,7 @@ import requests
 from pypdf import PdfReader
 
 APP_NAME="Tairon Offerte"
-VERSION="1.3.1-live"
+VERSION="1.3.2-live"
 ROOT=Path(__file__).resolve().parent
 DB_PATH=ROOT/"tairon_offerte.db"
 
@@ -74,6 +74,16 @@ ESSELUNGA_REGION=os.getenv("ESSELUNGA_REGION","Lombardia").strip() or "Lombardia
 ESSELUNGA_PAGE=f"https://www.esselunga.it/it-it/promozioni/volantini.{ESSELUNGA_STORE_CODE}.html"
 SUPERMARKET_PROMOTIONS=[]
 SUPERMARKET_OFFERS=[]
+
+# Cache/fallback volatile per i volantini Esselunga.
+# Serve a continuare a leggere il CDN anche quando www.esselunga.it va in timeout.
+ESSELUNGA_VIEWER_CACHE=[]
+ESSELUNGA_PROMO_CACHE=[]
+ESSELUNGA_KNOWN_VIEWERS=[
+    "https://www.esselunga.it/cdn/volantini/promozioni-Lt2p3Za1/Zona1-SM-Vol1/index.html",
+    "https://www.esselunga.it/cdn/volantini/promozioni-g5p9ct3w/Zona1-SM-Vol1/index.html",
+    "https://www.esselunga.it/cdn/volantini/promozioni-8yUsD3Pi/Zona1-SM-Vol1/index.html",
+]
 SOURCE_STATE={
     "amazon":{"name":"Amazon Italia / Creators API","configured":AMAZON_CONFIGURED,"live":False,"last_ok":None,"last_error":None,"items":0},
     "demo":{"name":"Dati demo","configured":DEMO_MODE,"live":DEMO_MODE,"last_ok":None,"last_error":None,"items":0},
@@ -288,6 +298,54 @@ def _esselunga_headers():
     }
 
 
+def _esselunga_get(url, timeout=6, attempts=3, headers=None):
+    """GET con retry rapido per evitare che un timeout temporaneo azzeri tutta la scansione."""
+    headers=headers or _esselunga_headers()
+    last=None
+    for attempt in range(1, attempts+1):
+        try:
+            r=requests.get(
+                url,
+                timeout=timeout,
+                headers=headers,
+                allow_redirects=True,
+            )
+            print(
+                f"[ESSELUNGA] GET attempt={attempt}/{attempts} "
+                f"status={r.status_code} bytes={len(r.content)} url={r.url}"
+            )
+            return r
+        except Exception as e:
+            last=e
+            print(
+                f"[ESSELUNGA] GET_RETRY attempt={attempt}/{attempts} "
+                f"url={url} error={str(e)[:150]}"
+            )
+    if last:
+        raise last
+    raise RuntimeError("GET Esselunga fallito")
+
+
+def _remember_esselunga_viewers(urls):
+    global ESSELUNGA_VIEWER_CACHE
+    for u in urls or []:
+        if not u:
+            continue
+        if '/cdn/volantini/' not in u.lower():
+            continue
+        if u not in ESSELUNGA_VIEWER_CACHE:
+            ESSELUNGA_VIEWER_CACHE.append(u)
+    ESSELUNGA_VIEWER_CACHE=ESSELUNGA_VIEWER_CACHE[-20:]
+
+
+def _cached_esselunga_targets():
+    out=[]
+    for u in ESSELUNGA_VIEWER_CACHE + ESSELUNGA_KNOWN_VIEWERS:
+        if u and u not in out:
+            out.append(u)
+    return out
+
+
 def _extract_offer_rows_from_text(raw_text, source_url, validity=''):
     """Estrae offerte Esselunga da testo HTML/JSON/JS del volantino digitale."""
     import hashlib
@@ -463,7 +521,7 @@ def _extract_offer_rows_from_flipbook(viewer_url, validity=''):
             continue
         visited.add(u)
         try:
-            r=requests.get(u,timeout=12,headers=headers,allow_redirects=True)
+            r=_esselunga_get(u,timeout=5,attempts=2,headers=headers)
         except Exception as e:
             print(f"[ESSELUNGA] FLIP_FETCH_ERROR url={u} error={str(e)[:140]}")
             continue
@@ -537,7 +595,7 @@ def _extract_esselunga_target(target_url, validity=''):
     """Prova PDF, HTML digitale e flipbook CDN, in quest'ordine."""
     headers=_esselunga_headers()
     try:
-        r=requests.get(target_url,timeout=12,headers=headers,allow_redirects=True)
+        r=_esselunga_get(target_url,timeout=5,attempts=2,headers=headers)
     except Exception as e:
         print(f"[ESSELUNGA] TARGET_FETCH_ERROR url={target_url} error={str(e)[:160]}")
         return [],None
@@ -571,6 +629,7 @@ def _extract_esselunga_target(target_url, validity=''):
         u for u in _discover_flipbook_urls(body,final_url)
         if '/cdn/volantini/' in u.lower() or u.lower().endswith('/index.html')
     ]
+    _remember_esselunga_viewers(viewers)
     print(f"[ESSELUNGA] VIEWERS count={len(viewers)} target={final_url}")
 
     for viewer in viewers[:3]:
@@ -588,24 +647,34 @@ def _extract_esselunga_target(target_url, validity=''):
 
 
 def fetch_esselunga_promotions():
-    """Legge campagne Esselunga e offerte da pagina digitale/flipbook/PDF."""
-    global SUPERMARKET_PROMOTIONS,SUPERMARKET_OFFERS
-    try:
-        headers=_esselunga_headers()
-        print(
-            f"[ESSELUNGA] START page={ESSELUNGA_PAGE} "
-            f"store={ESSELUNGA_STORE_CODE} region={ESSELUNGA_REGION}"
-        )
+    """Legge campagne/offerte Esselunga con retry e fallback diretto al CDN."""
+    global SUPERMARKET_PROMOTIONS,SUPERMARKET_OFFERS,ESSELUNGA_PROMO_CACHE
+    headers=_esselunga_headers()
+    print(
+        f"[ESSELUNGA] START page={ESSELUNGA_PAGE} "
+        f"store={ESSELUNGA_STORE_CODE} region={ESSELUNGA_REGION}"
+    )
 
-        r=requests.get(ESSELUNGA_PAGE,timeout=12,headers=headers,allow_redirects=True)
-        print(
-            f"[ESSELUNGA] LANDING status={r.status_code} final_url={r.url} "
-            f"bytes={len(r.content)}"
-        )
+    page=None
+    landing_url=ESSELUNGA_PAGE
+    landing_error=None
+
+    try:
+        r=_esselunga_get(ESSELUNGA_PAGE,timeout=5,attempts=3,headers=headers)
         r.raise_for_status()
         page=r.text or ''
-        found=[]
+        landing_url=r.url or ESSELUNGA_PAGE
+        print(
+            f"[ESSELUNGA] LANDING_OK final_url={landing_url} "
+            f"bytes={len(r.content)}"
+        )
+    except Exception as e:
+        landing_error=str(e)[:220]
+        print(f"[ESSELUNGA] LANDING_FAIL error={landing_error}")
 
+    found=[]
+
+    if page:
         matches=list(re.finditer(r'<h3[^>]*>(.*?)</h3>',page,flags=re.I|re.S))
         print(f"[ESSELUNGA] H3_FOUND count={len(matches)}")
 
@@ -625,21 +694,26 @@ def fetch_esselunga_promotions():
             validity=re.sub(r'\s+',' ',dm.group(1)).strip(' ·-') if dm else ''
 
             hrefs=[
-                urljoin(r.url,html_lib.unescape(h).replace('\\/','/'))
+                urljoin(landing_url,html_lib.unescape(h).replace('\\/','/'))
                 for h in re.findall(
                     r'(?:href|src|data-href|data-src|data-url)=["\']([^"\']+)["\']',
                     chunk,flags=re.I
                 )
             ]
 
-            # Priorità alla pagina digitale, poi al viewer/volantino generico.
             digital=next((h for h in hrefs if 'volantino-digitale' in h.lower()),None)
             flyer=next((h for h in hrefs if 'volantino.' in h.lower() or '/cdn/volantini/' in h.lower()),None)
             discover=next(
                 (h for h in hrefs if any(k in h.lower() for k in ('offerte','promo','flyer','leaflet'))),
                 None
             )
-            href=digital or flyer or discover or (hrefs[0] if hrefs else r.url)
+            href=digital or flyer or discover or (hrefs[0] if hrefs else landing_url)
+
+            viewers=[
+                u for u in hrefs
+                if '/cdn/volantini/' in u.lower()
+            ]
+            _remember_esselunga_viewers(viewers)
 
             found.append({
                 'id':f"esselunga-{ESSELUNGA_STORE_CODE}-{len(found)+1}",
@@ -653,6 +727,8 @@ def fetch_esselunga_promotions():
                 'store_code':ESSELUNGA_STORE_CODE
             })
 
+    # Se landing è riuscita, aggiorna la cache delle campagne.
+    if found:
         seen=set()
         out=[]
         for x in found:
@@ -661,88 +737,129 @@ def fetch_esselunga_promotions():
                 continue
             seen.add(k)
             out.append(x)
-
         SUPERMARKET_PROMOTIONS=out[:30]
-        print(f"[ESSELUNGA] CAMPAIGNS count={len(SUPERMARKET_PROMOTIONS)}")
+        ESSELUNGA_PROMO_CACHE=[dict(x) for x in SUPERMARKET_PROMOTIONS]
+        print(f"[ESSELUNGA] CAMPAIGNS count={len(SUPERMARKET_PROMOTIONS)} source=landing")
 
-        offers=[]
-        sources_ok=0
-
-        # Limita le campagne da analizzare per evitare il timeout del POST /scan/now.
-        for idx,promo in enumerate(SUPERMARKET_PROMOTIONS[:6],start=1):
-            targets=[]
-            for candidate in (
-                promo.get('offers_url'),
-                promo.get('flyer_url'),
-                promo.get('url'),
-            ):
-                if candidate and candidate not in targets:
-                    targets.append(candidate)
-
-            print(
-                f"[ESSELUNGA] CAMPAIGN index={idx} title={promo.get('title','')[:80]} "
-                f"targets={len(targets)}"
-            )
-
-            campaign_rows=[]
-            source_kind=None
-            for target in targets[:2]:
-                got,kind=_extract_esselunga_target(target,promo.get('validity',''))
-                if got:
-                    campaign_rows=got
-                    source_kind=kind
-                    break
-
-            if campaign_rows:
-                sources_ok+=1
-                promo['offer_source']=source_kind
-                promo['offers_count']=len(campaign_rows)
-                offers.extend(campaign_rows)
-                print(
-                    f"[ESSELUNGA] CAMPAIGN_DONE index={idx} "
-                    f"source={source_kind} offers={len(campaign_rows)}"
-                )
-            else:
-                promo['extract_error']='Nessuna offerta testuale trovata nel volantino digitale'
-                print(f"[ESSELUNGA] CAMPAIGN_EMPTY index={idx}")
-
-        dedup=[]
-        keys=set()
-        for x in offers:
-            k=(x['title'].lower(),x['price'],x['discount_pct'])
-            if k in keys:
-                continue
-            keys.add(k)
-            dedup.append(x)
-
-        SUPERMARKET_OFFERS=dedup[:80]
-        SOURCE_STATE['supermarkets'].update(
-            configured=True,
-            live=True,
-            last_ok=now_iso(),
-            last_error=None if SUPERMARKET_OFFERS else "Volantini trovati ma nessuna offerta testuale estratta",
-            items=len(SUPERMARKET_OFFERS),
-            campaigns=len(SUPERMARKET_PROMOTIONS),
-            offer_sources=sources_ok,
+    # Se la landing è KO, conserva/promuove la cache in memoria anziché azzerare tutto.
+    elif ESSELUNGA_PROMO_CACHE:
+        SUPERMARKET_PROMOTIONS=[dict(x) for x in ESSELUNGA_PROMO_CACHE]
+        print(
+            f"[ESSELUNGA] CAMPAIGNS count={len(SUPERMARKET_PROMOTIONS)} "
+            f"source=memory_cache"
         )
+    else:
+        SUPERMARKET_PROMOTIONS=[]
+
+    offers=[]
+    sources_ok=0
+
+    # 1) Prova le campagne normali/cache.
+    for idx,promo in enumerate(SUPERMARKET_PROMOTIONS[:5],start=1):
+        targets=[]
+        for candidate in (
+            promo.get('offers_url'),
+            promo.get('flyer_url'),
+            promo.get('url'),
+        ):
+            if candidate and candidate not in targets:
+                targets.append(candidate)
 
         print(
-            f"[ESSELUNGA] DONE campaigns={len(SUPERMARKET_PROMOTIONS)} "
-            f"sources_ok={sources_ok} offers={len(SUPERMARKET_OFFERS)}"
+            f"[ESSELUNGA] CAMPAIGN index={idx} title={promo.get('title','')[:80]} "
+            f"targets={len(targets)}"
         )
-        return SUPERMARKET_PROMOTIONS
 
-    except Exception as e:
-        SUPERMARKET_PROMOTIONS=[]
-        SUPERMARKET_OFFERS=[]
-        SOURCE_STATE['supermarkets'].update(
-            configured=True,
-            live=False,
-            last_error=str(e)[:240],
-            items=0
+        campaign_rows=[]
+        source_kind=None
+        for target in targets[:2]:
+            got,kind=_extract_esselunga_target(target,promo.get('validity',''))
+            if got:
+                campaign_rows=got
+                source_kind=kind
+                break
+
+        if campaign_rows:
+            sources_ok+=1
+            promo['offer_source']=source_kind
+            promo['offers_count']=len(campaign_rows)
+            offers.extend(campaign_rows)
+            print(
+                f"[ESSELUNGA] CAMPAIGN_DONE index={idx} "
+                f"source={source_kind} offers={len(campaign_rows)}"
+            )
+        else:
+            promo['extract_error']='Nessuna offerta testuale trovata'
+            print(f"[ESSELUNGA] CAMPAIGN_EMPTY index={idx}")
+
+    # 2) Fallback diretto CDN. Parte anche se www.esselunga.it è completamente irraggiungibile.
+    if not offers:
+        cached_targets=_cached_esselunga_targets()
+        print(f"[ESSELUNGA] CDN_FALLBACK targets={len(cached_targets)}")
+        for viewer in cached_targets[:6]:
+            try:
+                got=_extract_offer_rows_from_flipbook(viewer,'')
+            except Exception as e:
+                print(
+                    f"[ESSELUNGA] CDN_FALLBACK_ERROR "
+                    f"url={viewer} error={str(e)[:150]}"
+                )
+                continue
+            if got:
+                offers.extend(got)
+                sources_ok+=1
+                print(
+                    f"[ESSELUNGA] CDN_FALLBACK_OK "
+                    f"url={viewer} offers={len(got)}"
+                )
+                if len(offers)>=30:
+                    break
+
+    dedup=[]
+    keys=set()
+    for x in offers:
+        k=(x['title'].lower(),x['price'],x['discount_pct'])
+        if k in keys:
+            continue
+        keys.add(k)
+        dedup.append(x)
+
+    # Non cancellare offerte valide già lette in precedenza per un timeout temporaneo.
+    if dedup:
+        SUPERMARKET_OFFERS=dedup[:80]
+    elif SUPERMARKET_OFFERS:
+        print(
+            f"[ESSELUNGA] KEEP_PREVIOUS_OFFERS count={len(SUPERMARKET_OFFERS)} "
+            f"landing_error={bool(landing_error)}"
         )
-        print(f"[ESSELUNGA] FATAL error={str(e)[:240]}")
-        return []
+    else:
+        SUPERMARKET_OFFERS=[]
+
+    if not SUPERMARKET_PROMOTIONS and ESSELUNGA_PROMO_CACHE:
+        SUPERMARKET_PROMOTIONS=[dict(x) for x in ESSELUNGA_PROMO_CACHE]
+
+    err=None
+    if not SUPERMARKET_OFFERS:
+        err=landing_error or "Volantini raggiunti ma nessuna offerta testuale estratta"
+
+    SOURCE_STATE['supermarkets'].update(
+        configured=True,
+        live=bool(SUPERMARKET_OFFERS or SUPERMARKET_PROMOTIONS),
+        last_ok=now_iso() if (SUPERMARKET_OFFERS or SUPERMARKET_PROMOTIONS) else SOURCE_STATE['supermarkets'].get('last_ok'),
+        last_error=err,
+        items=len(SUPERMARKET_OFFERS),
+        campaigns=len(SUPERMARKET_PROMOTIONS),
+        offer_sources=sources_ok,
+        cdn_cache=len(ESSELUNGA_VIEWER_CACHE),
+    )
+
+    print(
+        f"[ESSELUNGA] DONE campaigns={len(SUPERMARKET_PROMOTIONS)} "
+        f"sources_ok={sources_ok} offers={len(SUPERMARKET_OFFERS)} "
+        f"cdn_cache={len(ESSELUNGA_VIEWER_CACHE)} "
+        f"landing_ok={page is not None}"
+    )
+    return SUPERMARKET_PROMOTIONS
 
 def _amazon_token_endpoint():
     # Credential version 3.2 is the EU token flow documented for IT.
