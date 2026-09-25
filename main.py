@@ -100,44 +100,185 @@ def _looks_like_product(line):
     return sum(c.isalpha() for c in t)>=4
 
 def _extract_offer_rows_from_pdf(pdf_bytes,pdf_url,validity=''):
+    """Estrae singole offerte dai volantini Esselunga in modo tollerante ai layout PDF."""
+    import hashlib
     rows=[]
-    reader=PdfReader(BytesIO(pdf_bytes))
-    for page_no,page in enumerate(reader.pages[:36],start=1):
-        text=page.extract_text() or ''
-        lines=[re.sub(r'\s+',' ',x).strip() for x in text.splitlines() if x.strip()]
-        for i,line in enumerate(lines):
-            dm=re.search(r'SCONTO\s+(?:FIDATY\s*)?-?\s*(\d{1,2})\s*%',line,flags=re.I)
-            if not dm: dm=re.search(r'-\s*(\d{1,2})\s*%',line)
-            if not dm: continue
-            discount=int(dm.group(1))
-            if discount<20: continue
-            title=''
-            for j in range(i-1,max(-1,i-14),-1):
-                if _looks_like_product(lines[j]):
-                    title=lines[j]
-                    if j>0 and _looks_like_product(lines[j-1]) and len(lines[j-1]+' '+title)<=95:
-                        title=lines[j-1]+' '+title
+    seen=set()
+    total_markers=0
+
+    def clean_line(s):
+        s=(s or '').replace('\xa0',' ')
+        return re.sub(r'\s+',' ',s).strip()
+
+    def parse_price(s):
+        if not s: return None
+        s=s.replace('€','').replace('EUR','').strip()
+        s=re.sub(r'[^\d,\.]','',s)
+        if not s: return None
+        if ',' in s:
+            s=s.replace('.','').replace(',','.')
+        try:
+            v=float(s)
+            return round(v,2) if 0.01<=v<=9999 else None
+        except Exception:
+            return None
+
+    def find_prices(txt):
+        vals=[]
+        for pat in (
+            r'€\s*(\d{1,4}[,.]\d{2})',
+            r'(\d{1,4}[,.]\d{2})\s*€',
+            r'\b(\d{1,3}[,.]\d{2})\b',
+        ):
+            for m in re.finditer(pat,txt,flags=re.I):
+                v=parse_price(m.group(1))
+                if v is not None and v not in vals:
+                    vals.append(v)
+        return vals
+
+    def find_discount(txt):
+        for pat in (
+            r'SCONTO\s+FIDATY\s*-?\s*(\d{1,2})\s*%',
+            r'SCONTO\s*-?\s*(\d{1,2})\s*%',
+            r'-\s*(\d{1,2})\s*%',
+            r'(\d{1,2})\s*%\s+DI\s+SCONTO',
+        ):
+            m=re.search(pat,txt,flags=re.I)
+            if m:
+                try:
+                    pct=int(m.group(1))
+                    if 1<=pct<=90: return pct
+                except Exception:
+                    pass
+        return None
+
+    def title_score(line):
+        if not line: return -100
+        up=line.upper()
+        if any(x in up for x in ('SCONTO','FIDATY','PREZZO','OFFERTA','VALIDO','RISPARMIO','EURO','€')):
+            return -20
+        letters=len(re.findall(r'[A-Za-zÀ-ÿ]',line))
+        digits=len(re.findall(r'\d',line))
+        if letters<3: return -20
+        score=letters + (10 if 5<=len(line)<=95 else 0)
+        if digits>letters: score-=10
+        return score
+
+    try:
+        reader=PdfReader(BytesIO(pdf_bytes))
+    except Exception as e:
+        print(f'[ESSELUNGA] errore apertura PDF: {e}')
+        return []
+
+    print(f'[ESSELUNGA] PDF aperto: {len(reader.pages)} pagine url={pdf_url}')
+
+    for page_no,page in enumerate(reader.pages[:40],start=1):
+        try:
+            raw=page.extract_text() or ''
+        except Exception as e:
+            print(f'[ESSELUNGA] errore estrazione pagina={page_no}: {e}')
+            continue
+        if not raw.strip():
+            continue
+
+        lines=[clean_line(x) for x in raw.splitlines() if clean_line(x)]
+        normalized='\n'.join(lines)
+        markers=[]
+
+        for pat in (
+            r'SCONTO\s+FIDATY\s*-?\s*(\d{1,2})\s*%',
+            r'SCONTO\s*-?\s*(\d{1,2})\s*%',
+            r'-\s*(\d{1,2})\s*%',
+            r'(\d{1,2})\s*%\s+DI\s+SCONTO',
+        ):
+            for m in re.finditer(pat,normalized,flags=re.I):
+                try: pct=int(m.group(1))
+                except Exception: continue
+                if 1<=pct<=90:
+                    markers.append((m.start(),m.end(),pct))
+
+        # Fallback riga per riga per PDF con testo molto frammentato.
+        if not markers:
+            for idx,line in enumerate(lines):
+                pct=find_discount(line)
+                if pct:
+                    markers.append(('line',idx,pct))
+
+        total_markers+=len(markers)
+
+        for marker in markers:
+            if marker[0]=='line':
+                idx=marker[1]; discount=marker[2]
+                a=max(0,idx-8); b=min(len(lines),idx+9)
+                win_lines=lines[a:b]
+                win_text=' '.join(win_lines)
+            else:
+                a,b,discount=marker
+                left=max(0,a-500); right=min(len(normalized),b+500)
+                win_text=normalized[left:right]
+                win_lines=[clean_line(x) for x in win_text.splitlines() if clean_line(x)]
+
+            prices=find_prices(win_text)
+            if not prices:
+                continue
+
+            title=None
+            for cand in sorted(win_lines,key=title_score,reverse=True):
+                if title_score(cand)>0:
+                    title=cand
                     break
-            if not title: continue
-            original=None
-            for j in range(i-1,max(-1,i-8),-1):
-                v=_price_value(lines[j])
-                if v is not None:
-                    original=v; break
-            offer=None
-            for j in range(i+1,min(len(lines),i+9)):
-                v=_price_value(lines[j])
-                if v is not None:
-                    offer=v; break
-            if offer is None: continue
-            if original is not None and offer>=original: original=None
-            rows.append({'id':f"esselunga-{ESSELUNGA_STORE_CODE}-p{page_no}-{len(rows)+1}",'title':title.title() if title.isupper() else title,'retailer':'Esselunga','region':ESSELUNGA_REGION,'price':round(offer,2),'original_price':round(original,2) if original else None,'discount_pct':discount,'validity':validity,'url':pdf_url,'page':page_no,'source_type':'market'})
-    seen=set(); out=[]
-    for x in sorted(rows,key=lambda z:(-z['discount_pct'],z['price'])):
-        k=(x['title'].lower(),x['price'],x['discount_pct'])
-        if k in seen: continue
-        seen.add(k); out.append(x)
-    return out[:60]
+            if not title:
+                continue
+
+            title=clean_line(re.sub(r'€?\s*\d{1,4}[,.]\d{2}\s*€?','',title))
+            if len(title)<3:
+                continue
+
+            offer=min(prices)
+            original=max(prices) if len(prices)>=2 else None
+            if original is not None and original<=offer:
+                original=None
+
+            # Se il vecchio prezzo non è leggibile, ricavalo dallo sconto dichiarato.
+            if original is None and discount:
+                try:
+                    est=round(offer/(1-discount/100),2)
+                    if est>offer: original=est
+                except Exception:
+                    pass
+            elif original is not None:
+                try:
+                    calc=round(((original-offer)/original)*100)
+                    if abs(calc-discount)>20:
+                        est=round(offer/(1-discount/100),2)
+                        if est>offer: original=est
+                except Exception:
+                    pass
+
+            key=(title.lower(),offer,discount,page_no)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            raw_id=f'{title}|{offer}|{discount}|{page_no}|{pdf_url}'
+            oid='esselunga-'+hashlib.sha1(raw_id.encode('utf-8')).hexdigest()[:16]
+            rows.append({
+                'id':oid,
+                'title':title.title() if title.isupper() else title,
+                'retailer':'Esselunga',
+                'region':ESSELUNGA_REGION,
+                'price':round(offer,2),
+                'original_price':round(original,2) if original else None,
+                'discount_pct':discount,
+                'validity':validity,
+                'url':pdf_url,
+                'page':page_no,
+                'source_type':'market'
+            })
+
+    rows=sorted(rows,key=lambda z:(-z['discount_pct'],z['price']))
+    print(f'[ESSELUNGA] marker_sconto={total_markers} offerte_estratte={len(rows)} url={pdf_url}')
+    return rows[:80]
 
 def _find_pdf_url(target_url):
     r=requests.get(target_url,timeout=25,headers={"User-Agent":"Mozilla/5.0 (compatible; Tairon-Offerte/1.3)","Accept-Language":"it-IT,it;q=0.9"})
@@ -331,7 +472,6 @@ async def scan_once():
     real_rows=await asyncio.to_thread(fetch_amazon_deals,terms)
     await asyncio.to_thread(fetch_esselunga_promotions)
     rows=list(real_rows)
-    rows.extend(SUPERMARKET_OFFERS)
     if DEMO_MODE:
         for d in DEMO:
             rows.append({**d,'price':round(d['offer']*(1+random.uniform(-0.01,0.01)),2),'live_source':'demo'})
@@ -342,7 +482,7 @@ async def scan_once():
         p={**d,'price':price}
         con.execute("INSERT INTO products(id,title,brand,source_type,retailer,region,unit,url,image_url) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET title=excluded.title,brand=excluded.brand,source_type=excluded.source_type,retailer=excluded.retailer,region=excluded.region,unit=excluded.unit,url=excluded.url,image_url=excluded.image_url",(p['id'],p['title'],p.get('brand'),p['source_type'],p['retailer'],p.get('region'),p.get('unit'),p.get('url'),p.get('image_url')))
         hist=[float(r['price']) for r in con.execute("SELECT price FROM prices WHERE product_id=? ORDER BY id DESC LIMIT 180",(p['id'],))]
-        baseline=float(d.get('original_price') or d.get('base') or price)
+        baseline=float(d.get('base') or price)
         # Local history becomes increasingly important over time; first observation can use Amazon saving basis.
         m=calc_metrics(hist,price,baseline)
         if p['id'].startswith('amazon-') and not hist and baseline>0:
