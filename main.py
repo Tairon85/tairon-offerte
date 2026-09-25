@@ -13,7 +13,7 @@ import requests
 from pypdf import PdfReader
 
 APP_NAME="Tairon Offerte"
-VERSION="1.3.7-live"
+VERSION="1.3.8-live"
 ROOT=Path(__file__).resolve().parent
 DB_PATH=ROOT/"tairon_offerte.db"
 
@@ -81,7 +81,7 @@ ESSELUNGA_VIEWER_CACHE=[]
 ESSELUNGA_PROMO_CACHE=[]
 ESSELUNGA_KNOWN_VIEWERS=[
     "https://www.esselunga.it/cdn/volantini/promozioni-Lt2p3Za1/Zona1-SM-Vol1/index.html",
-    "https://www.esselunga.it/cdn/volantini/promozioni-g5p9ct3w/Zona1-SM-Vol1/index.html",
+    "https://www.esselunga.it/cdn/volantini/promozioni-g5P9Ct3w/Zona1-SM-Vol1/index.html",
     "https://www.esselunga.it/cdn/volantini/promozioni-8yUsD3Pi/Zona1-SM-Vol1/index.html",
 ]
 SOURCE_STATE={
@@ -574,7 +574,7 @@ def _discover_flipbook_urls(page_text, base_url):
         if not v:
             return
         v=html_lib.unescape(v).replace('\\/','/').strip().strip('"\' ')
-        if not v or v.startswith(('data:','javascript:','#')):
+        if not v or v.startswith(('data:','javascript:','#')) or '{{' in v or '%7B%7B' in v.upper():
             return
         if v.startswith('//'):
             v='https:'+v
@@ -641,6 +641,70 @@ def _extract_svg_visible_text(svg_text):
     return '\n'.join(chunks)
 
 
+def _discover_flippingbook_substrates(viewer_url, max_pages=80):
+    """Trova le immagini pagina reali del FlippingBook."""
+    base=viewer_url.rsplit('/',1)[0] + '/'
+    headers=_esselunga_headers()
+    found=[]
+    misses_after_found=0
+
+    for page_no in range(1,max_pages+1):
+        page=f'{page_no:04d}'
+        page_hit=None
+
+        # FlippingBook usa di solito _1.._4 in base alla risoluzione/export.
+        candidates=[
+            f'files/assets/common/page-html5-substrates/page{page}_4.jpg',
+            f'files/assets/common/page-html5-substrates/page{page}_3.jpg',
+            f'files/assets/common/page-html5-substrates/page{page}_2.jpg',
+            f'files/assets/common/page-html5-substrates/page{page}_1.jpg',
+            f'files/assets/common/page-html5-substrates/page{page}.jpg',
+            f'files/assets/common/page-substrates/page{page}.jpg',
+        ]
+
+        for rel in candidates:
+            u=urljoin(base,rel)
+            try:
+                r=_esselunga_get(u,timeout=4,attempts=1,headers=headers)
+            except Exception:
+                continue
+            if r.ok and (r.headers.get('content-type') or '').lower().startswith('image/'):
+                page_hit=u
+                print(
+                    f"[ESSELUNGA] PAGE_IMAGE page={page} bytes={len(r.content)} "
+                    f"url={u}"
+                )
+                break
+
+        if page_hit:
+            found.append(page_hit)
+            misses_after_found=0
+        else:
+            misses_after_found += 1
+            if found and misses_after_found >= 3:
+                break
+            if not found and page_no >= 4:
+                break
+
+    print(
+        f"[ESSELUNGA] PAGE_IMAGES_DONE viewer={viewer_url} count={len(found)}"
+    )
+    return found
+
+
+def _svg_diagnostics(svg_text):
+    """Diagnostica il tipo di SVG quando il testo è convertito in tracciati."""
+    s=svg_text or ''
+    return {
+        'text': len(re.findall(r'<text\b',s,flags=re.I)),
+        'tspan': len(re.findall(r'<tspan\b',s,flags=re.I)),
+        'path': len(re.findall(r'<path\b',s,flags=re.I)),
+        'use': len(re.findall(r'<use\b',s,flags=re.I)),
+        'glyph': len(re.findall(r'<glyph\b',s,flags=re.I)),
+        'image': len(re.findall(r'<image\b',s,flags=re.I)),
+    }
+
+
 def _extract_flippingbook_vectorlayers(viewer_url, validity=''):
     """Legge i page-vectorlayers del FlippingBook senza OCR."""
     base=viewer_url.rsplit('/',1)[0] + '/'
@@ -675,9 +739,11 @@ def _extract_flippingbook_vectorlayers(viewer_url, validity=''):
         pages_ok += 1
         body=r.text or ''
         visible=_extract_svg_visible_text(body)
+        diag=_svg_diagnostics(body)
         print(
             f"[ESSELUNGA] VECTOR_PAGE page={page} bytes={len(r.content)} "
-            f"visible_chars={len(visible)}"
+            f"visible_chars={len(visible)} text={diag['text']} tspan={diag['tspan']} "
+            f"path={diag['path']} use={diag['use']} glyph={diag['glyph']} image={diag['image']}"
         )
 
         if visible:
@@ -713,6 +779,15 @@ def _extract_offer_rows_from_flipbook(viewer_url, validity=''):
         print(f"[ESSELUNGA] VECTOR_HANDOFF offers={len(vector_rows)}")
         return vector_rows
 
+    # Se il testo è convertito in path SVG, individua almeno le vere immagini
+    # pagina del volantino. Questo rende il prossimo fallback OCR deterministico.
+    page_images=_discover_flippingbook_substrates(viewer_url)
+    if page_images:
+        print(
+            f"[ESSELUNGA] IMAGE_PAGES_READY count={len(page_images)} "
+            f"sample={page_images[:3]}"
+        )
+
     rows=[]
     visited=set()
     queue=[viewer_url]
@@ -725,7 +800,7 @@ def _extract_offer_rows_from_flipbook(viewer_url, validity=''):
         if u not in queue:
             queue.append(u)
 
-    while queue and len(visited)<12:
+    while queue and len(visited)<8:
         u=queue.pop(0)
         if u in visited:
             continue
