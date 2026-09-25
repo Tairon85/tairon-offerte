@@ -281,70 +281,331 @@ def _extract_offer_rows_from_pdf(pdf_bytes,pdf_url,validity=''):
     return rows[:80]
 
 def _find_pdf_url(target_url):
-    r=requests.get(target_url,timeout=25,headers={"User-Agent":"Mozilla/5.0 (compatible; Tairon-Offerte/1.3)","Accept-Language":"it-IT,it;q=0.9"})
+    """Trova e scarica il PDF del volantino Esselunga partendo da pagina/redirect/asset."""
+    headers={
+        "User-Agent":"Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 Safari/604.1",
+        "Accept-Language":"it-IT,it;q=0.9,en;q=0.5",
+        "Accept":"text/html,application/xhtml+xml,application/pdf;q=0.9,*/*;q=0.8",
+    }
+    print(f"[ESSELUNGA] PDF_DISCOVERY target={target_url}")
+
+    r=requests.get(target_url,timeout=25,headers=headers,allow_redirects=True)
+    print(
+        f"[ESSELUNGA] PDF_DISCOVERY page_status={r.status_code} "
+        f"final_url={r.url} content_type={(r.headers.get('content-type') or '')[:80]} "
+        f"bytes={len(r.content)}"
+    )
     r.raise_for_status()
+
     ctype=(r.headers.get('content-type') or '').lower()
-    if 'application/pdf' in ctype or target_url.lower().endswith('.pdf'):
-        return target_url,r.content
-    page=r.text
+    final_url=r.url or target_url
+
+    if 'application/pdf' in ctype or final_url.lower().split('?',1)[0].endswith('.pdf'):
+        print(f"[ESSELUNGA] PDF_FOUND direct url={final_url} bytes={len(r.content)}")
+        return final_url,r.content
+
+    page=r.text or ''
     candidates=[]
-    for pat in [r'(["\'])([^"\']*volantino_esselunga\.pdf[^"\']*)\1',r'(["\'])([^"\']+\.pdf(?:\?[^"\']*)?)\1']:
+
+    def add_candidate(value):
+        if not value:
+            return
+        value=html_lib.unescape(value)
+        value=value.replace('\\/','/').replace('\\u002F','/').replace('\\u002f','/')
+        value=value.replace('&amp;','&').strip().strip('"\' ')
+        if value.startswith('//'):
+            value='https:'+value
+        full=urljoin(final_url,value)
+        if full not in candidates:
+            candidates.append(full)
+
+    # URL PDF espliciti, inclusi JSON/JS escapati.
+    for m in re.finditer(r'https?:\\?/\\?/[^"\'\s<>]+?\.pdf(?:\?[^"\'\s<>]*)?',page,flags=re.I):
+        add_candidate(m.group(0).replace('\\/','/'))
+
+    for m in re.finditer(r'(?:"|\')([^"\']+?\.pdf(?:\?[^"\']*)?)(?:"|\')',page,flags=re.I):
+        add_candidate(m.group(1))
+
+    # Link/iframe/source/data-* che possono portare alla pagina del volantino.
+    secondary=[]
+    for pat in (
+        r'(?:href|src|data-href|data-src|data-url|content)=["\']([^"\']+)["\']',
+        r'["\'](https?:\\?/\\?/[^"\']*(?:volantin|flyer|leaflet|catalog)[^"\']*)["\']',
+    ):
         for m in re.finditer(pat,page,flags=re.I):
-            candidates.append(html_lib.unescape(m.group(2)).replace('\\/','/'))
-    if not candidates: return None,None
-    pdf_url=urljoin(target_url,candidates[0])
-    pr=requests.get(pdf_url,timeout=30,headers={"User-Agent":"Mozilla/5.0 (compatible; Tairon-Offerte/1.3)"})
-    pr.raise_for_status()
-    return pdf_url,pr.content
+            v=html_lib.unescape(m.group(1)).replace('\\/','/')
+            if any(k in v.lower() for k in ('volantin','flyer','leaflet','catalog','promozion')):
+                full=urljoin(final_url,v)
+                if full not in secondary and full!=final_url:
+                    secondary.append(full)
+
+    print(
+        f"[ESSELUNGA] PDF_DISCOVERY pdf_candidates={len(candidates)} "
+        f"secondary_candidates={len(secondary)}"
+    )
+
+    # Prova tutti i PDF trovati, non solo il primo.
+    for pdf_url in candidates[:20]:
+        try:
+            pr=requests.get(pdf_url,timeout=30,headers=headers,allow_redirects=True)
+            pct=(pr.headers.get('content-type') or '').lower()
+            is_pdf=('application/pdf' in pct or pr.url.lower().split('?',1)[0].endswith('.pdf')
+                    or pr.content[:4]==b'%PDF')
+            print(
+                f"[ESSELUNGA] PDF_TRY status={pr.status_code} pdf={is_pdf} "
+                f"bytes={len(pr.content)} url={pr.url}"
+            )
+            if pr.ok and is_pdf and len(pr.content)>1000:
+                print(f"[ESSELUNGA] PDF_FOUND url={pr.url} bytes={len(pr.content)}")
+                return pr.url,pr.content
+        except Exception as e:
+            print(f"[ESSELUNGA] PDF_TRY_ERROR url={pdf_url} error={str(e)[:180]}")
+
+    # Se la prima pagina rimanda a un viewer/landing, esploralo di un livello.
+    for second_url in secondary[:12]:
+        try:
+            sr=requests.get(second_url,timeout=25,headers=headers,allow_redirects=True)
+            sct=(sr.headers.get('content-type') or '').lower()
+            print(
+                f"[ESSELUNGA] SECONDARY status={sr.status_code} "
+                f"content_type={sct[:70]} bytes={len(sr.content)} url={sr.url}"
+            )
+            if not sr.ok:
+                continue
+            if 'application/pdf' in sct or sr.content[:4]==b'%PDF':
+                print(f"[ESSELUNGA] PDF_FOUND secondary_direct url={sr.url} bytes={len(sr.content)}")
+                return sr.url,sr.content
+
+            spage=sr.text or ''
+            nested=[]
+            for m in re.finditer(r'https?:\\?/\\?/[^"\'\s<>]+?\.pdf(?:\?[^"\'\s<>]*)?',spage,flags=re.I):
+                u=m.group(0).replace('\\/','/')
+                u=html_lib.unescape(u)
+                if u not in nested: nested.append(u)
+            for m in re.finditer(r'(?:"|\')([^"\']+?\.pdf(?:\?[^"\']*)?)(?:"|\')',spage,flags=re.I):
+                u=urljoin(sr.url,html_lib.unescape(m.group(1)).replace('\\/','/'))
+                if u not in nested: nested.append(u)
+
+            print(f"[ESSELUNGA] SECONDARY nested_pdf_candidates={len(nested)}")
+            for pdf_url in nested[:12]:
+                try:
+                    pr=requests.get(pdf_url,timeout=30,headers=headers,allow_redirects=True)
+                    pct=(pr.headers.get('content-type') or '').lower()
+                    is_pdf=('application/pdf' in pct or pr.content[:4]==b'%PDF')
+                    print(
+                        f"[ESSELUNGA] NESTED_PDF_TRY status={pr.status_code} pdf={is_pdf} "
+                        f"bytes={len(pr.content)} url={pr.url}"
+                    )
+                    if pr.ok and is_pdf and len(pr.content)>1000:
+                        print(f"[ESSELUNGA] PDF_FOUND nested url={pr.url} bytes={len(pr.content)}")
+                        return pr.url,pr.content
+                except Exception as e:
+                    print(f"[ESSELUNGA] NESTED_PDF_ERROR url={pdf_url} error={str(e)[:180]}")
+        except Exception as e:
+            print(f"[ESSELUNGA] SECONDARY_ERROR url={second_url} error={str(e)[:180]}")
+
+    print(f"[ESSELUNGA] PDF_NOT_FOUND target={target_url}")
+    return None,None
+
 
 def fetch_esselunga_promotions():
-    """Legge campagne Esselunga ed estrae le singole offerte con percentuale dai volantini ufficiali."""
+    """Legge campagne Esselunga, scopre il PDF e ne estrae le singole offerte."""
     global SUPERMARKET_PROMOTIONS,SUPERMARKET_OFFERS
     try:
-        r=requests.get(ESSELUNGA_PAGE,timeout=20,headers={"User-Agent":"Mozilla/5.0 (compatible; Tairon-Offerte/1.3)","Accept-Language":"it-IT,it;q=0.9"})
-        r.raise_for_status(); page=r.text; found=[]
+        headers={
+            "User-Agent":"Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 Safari/604.1",
+            "Accept-Language":"it-IT,it;q=0.9",
+        }
+        print(
+            f"[ESSELUNGA] START page={ESSELUNGA_PAGE} "
+            f"store={ESSELUNGA_STORE_CODE} region={ESSELUNGA_REGION}"
+        )
+
+        r=requests.get(ESSELUNGA_PAGE,timeout=20,headers=headers,allow_redirects=True)
+        print(
+            f"[ESSELUNGA] LANDING status={r.status_code} final_url={r.url} "
+            f"bytes={len(r.content)}"
+        )
+        r.raise_for_status()
+        page=r.text or ''
+        found=[]
+
         matches=list(re.finditer(r'<h3[^>]*>(.*?)</h3>',page,flags=re.I|re.S))
+        print(f"[ESSELUNGA] H3_FOUND count={len(matches)}")
+
         for i,m in enumerate(matches):
             title=_plain_html(m.group(1))
-            if not title or 'PROMOZIONI' in title.upper() or title.lower().startswith('seleziona un negozio'): continue
-            end=matches[i+1].start() if i+1<len(matches) else min(len(page),m.end()+5000)
-            chunk=page[m.end():end]; txt=_plain_html(chunk)
-            dm=re.search(r'((?:Dal|Fino al)\s+.{3,90}?)(?=(?:Sfoglia|Scopri|Altri|Novit|Ultimo|In arrivo|$))',txt,flags=re.I)
+            if not title or 'PROMOZIONI' in title.upper() or title.lower().startswith('seleziona un negozio'):
+                continue
+            end=matches[i+1].start() if i+1<len(matches) else min(len(page),m.end()+8000)
+            chunk=page[m.end():end]
+            txt=_plain_html(chunk)
+            dm=re.search(
+                r'((?:Dal|Fino al)\s+.{3,120}?)(?=(?:Sfoglia|Scopri|Altri|Novit|Ultimo|In arrivo|$))',
+                txt,flags=re.I
+            )
             validity=re.sub(r'\s+',' ',dm.group(1)).strip(' ·-') if dm else ''
-            hrefs=[urljoin(ESSELUNGA_PAGE,h) for h in re.findall(r'href=["\']([^"\']+)["\']',chunk,flags=re.I)]
-            flyer=next((h for h in hrefs if 'volantino' in h.lower()),None)
-            discover=next((h for h in hrefs if 'volantino-digitale' in h.lower() or 'offerte' in h.lower()),None)
-            href=flyer or discover or (hrefs[0] if hrefs else ESSELUNGA_PAGE)
-            found.append({'id':f"esselunga-{ESSELUNGA_STORE_CODE}-{len(found)+1}",'title':title,'retailer':'Esselunga','region':ESSELUNGA_REGION,'validity':validity,'url':href,'flyer_url':flyer,'offers_url':discover,'store_code':ESSELUNGA_STORE_CODE})
-        seen=set(); out=[]
+            hrefs=[
+                urljoin(r.url,h)
+                for h in re.findall(
+                    r'(?:href|src|data-href|data-src|data-url)=["\']([^"\']+)["\']',
+                    chunk,flags=re.I
+                )
+            ]
+            flyer=next((h for h in hrefs if 'volantin' in h.lower()),None)
+            discover=next(
+                (h for h in hrefs if any(k in h.lower() for k in ('offerte','promo','flyer','leaflet'))),
+                None
+            )
+            href=flyer or discover or (hrefs[0] if hrefs else r.url)
+            found.append({
+                'id':f"esselunga-{ESSELUNGA_STORE_CODE}-{len(found)+1}",
+                'title':title,
+                'retailer':'Esselunga',
+                'region':ESSELUNGA_REGION,
+                'validity':validity,
+                'url':href,
+                'flyer_url':flyer,
+                'offers_url':discover,
+                'store_code':ESSELUNGA_STORE_CODE
+            })
+
+        # Fallback: se gli h3 cambiano struttura, usa direttamente i link volantino/promo della pagina.
+        if not found:
+            raw_links=[]
+            for m in re.finditer(
+                r'(?:href|src|data-href|data-src|data-url)=["\']([^"\']+)["\']',
+                page,flags=re.I
+            ):
+                u=urljoin(r.url,html_lib.unescape(m.group(1)).replace('\\/','/'))
+                if any(k in u.lower() for k in ('volantin','offerte','promo','flyer','leaflet')):
+                    if u not in raw_links: raw_links.append(u)
+            for u in raw_links[:20]:
+                found.append({
+                    'id':f"esselunga-{ESSELUNGA_STORE_CODE}-{len(found)+1}",
+                    'title':'Volantino Esselunga',
+                    'retailer':'Esselunga',
+                    'region':ESSELUNGA_REGION,
+                    'validity':'',
+                    'url':u,
+                    'flyer_url':u,
+                    'offers_url':None,
+                    'store_code':ESSELUNGA_STORE_CODE
+                })
+            print(f"[ESSELUNGA] FALLBACK_LINKS count={len(raw_links)}")
+
+        seen=set()
+        out=[]
         for x in found:
-            k=(x['title'].lower(),x['validity'].lower())
-            if k in seen: continue
-            seen.add(k); out.append(x)
+            k=(x['title'].lower(),x['validity'].lower(),x.get('url',''))
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(x)
+
         SUPERMARKET_PROMOTIONS=out[:30]
+        print(f"[ESSELUNGA] CAMPAIGNS count={len(SUPERMARKET_PROMOTIONS)}")
+
         offers=[]
-        for promo in SUPERMARKET_PROMOTIONS[:8]:
-            target=promo.get('flyer_url') or promo.get('offers_url') or promo.get('url')
-            if not target: continue
-            try:
-                pdf_url,pdf_bytes=_find_pdf_url(target)
-                if pdf_url and pdf_bytes:
-                    promo['pdf_url']=pdf_url
-                    offers.extend(_extract_offer_rows_from_pdf(pdf_bytes,pdf_url,promo.get('validity','')))
-            except Exception as pe:
-                promo['extract_error']=str(pe)[:160]
-        dedup=[]; keys=set()
+        pdf_found=0
+
+        for idx,promo in enumerate(SUPERMARKET_PROMOTIONS[:12],start=1):
+            targets=[]
+            for candidate in (
+                promo.get('flyer_url'),
+                promo.get('offers_url'),
+                promo.get('url'),
+                ESSELUNGA_PAGE,
+            ):
+                if candidate and candidate not in targets:
+                    targets.append(candidate)
+
+            print(
+                f"[ESSELUNGA] CAMPAIGN index={idx} title={promo.get('title','')[:80]} "
+                f"targets={len(targets)}"
+            )
+
+            campaign_pdf=None
+            campaign_bytes=None
+
+            for target in targets:
+                try:
+                    pdf_url,pdf_bytes=_find_pdf_url(target)
+                    if pdf_url and pdf_bytes:
+                        campaign_pdf=pdf_url
+                        campaign_bytes=pdf_bytes
+                        break
+                except Exception as pe:
+                    print(
+                        f"[ESSELUNGA] DISCOVERY_ERROR campaign={idx} "
+                        f"target={target} error={str(pe)[:180]}"
+                    )
+
+            if campaign_pdf and campaign_bytes:
+                pdf_found+=1
+                promo['pdf_url']=campaign_pdf
+                print(
+                    f"[ESSELUNGA] EXTRACT_START campaign={idx} "
+                    f"bytes={len(campaign_bytes)} pdf={campaign_pdf}"
+                )
+                try:
+                    extracted=_extract_offer_rows_from_pdf(
+                        campaign_bytes,
+                        campaign_pdf,
+                        promo.get('validity','')
+                    )
+                    print(
+                        f"[ESSELUNGA] EXTRACT_DONE campaign={idx} "
+                        f"offers={len(extracted)}"
+                    )
+                    offers.extend(extracted)
+                except Exception as pe:
+                    promo['extract_error']=str(pe)[:160]
+                    print(
+                        f"[ESSELUNGA] EXTRACT_ERROR campaign={idx} "
+                        f"error={str(pe)[:180]}"
+                    )
+            else:
+                promo['extract_error']='PDF non trovato'
+                print(f"[ESSELUNGA] CAMPAIGN_NO_PDF index={idx}")
+
+        dedup=[]
+        keys=set()
         for x in offers:
             k=(x['title'].lower(),x['price'],x['discount_pct'])
-            if k in keys: continue
-            keys.add(k); dedup.append(x)
+            if k in keys:
+                continue
+            keys.add(k)
+            dedup.append(x)
+
         SUPERMARKET_OFFERS=dedup[:80]
-        SOURCE_STATE['supermarkets'].update(configured=True,live=True,last_ok=now_iso(),last_error=None,items=len(SUPERMARKET_OFFERS),campaigns=len(SUPERMARKET_PROMOTIONS))
+        SOURCE_STATE['supermarkets'].update(
+            configured=True,
+            live=True,
+            last_ok=now_iso(),
+            last_error=None if pdf_found else "Nessun PDF Esselunga trovato",
+            items=len(SUPERMARKET_OFFERS),
+            campaigns=len(SUPERMARKET_PROMOTIONS),
+            pdfs=pdf_found,
+        )
+
+        print(
+            f"[ESSELUNGA] DONE campaigns={len(SUPERMARKET_PROMOTIONS)} "
+            f"pdfs={pdf_found} offers={len(SUPERMARKET_OFFERS)}"
+        )
         return SUPERMARKET_PROMOTIONS
+
     except Exception as e:
-        SUPERMARKET_PROMOTIONS=[]; SUPERMARKET_OFFERS=[]
-        SOURCE_STATE['supermarkets'].update(configured=True,live=False,last_error=str(e)[:240],items=0)
-        print('esselunga promotions error',e); return []
+        SUPERMARKET_PROMOTIONS=[]
+        SUPERMARKET_OFFERS=[]
+        SOURCE_STATE['supermarkets'].update(
+            configured=True,
+            live=False,
+            last_error=str(e)[:240],
+            items=0
+        )
+        print(f"[ESSELUNGA] FATAL error={str(e)[:240]}")
+        return []
 
 def _amazon_token_endpoint():
     # Credential version 3.2 is the EU token flow documented for IT.
