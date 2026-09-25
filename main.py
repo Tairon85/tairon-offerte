@@ -11,9 +11,16 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, Res
 from pydantic import BaseModel
 import requests
 from pypdf import PdfReader
+try:
+    from PIL import Image, ImageOps, ImageEnhance
+    import pytesseract
+    OCR_IMPORT_OK=True
+except Exception:
+    Image=ImageOps=ImageEnhance=pytesseract=None
+    OCR_IMPORT_OK=False
 
 APP_NAME="Tairon Offerte"
-VERSION="1.3.8-live"
+VERSION="1.3.9-live"
 ROOT=Path(__file__).resolve().parent
 DB_PATH=ROOT/"tairon_offerte.db"
 
@@ -768,6 +775,104 @@ def _extract_flippingbook_vectorlayers(viewer_url, validity=''):
 
 
 
+def _ocr_esselunga_page(image_url, page_no, validity=''):
+    """OCR di una pagina reale del volantino; fallback finale, usato solo su immagini confermate."""
+    if not OCR_IMPORT_OK:
+        print("[ESSELUNGA] OCR_UNAVAILABLE reason=python_packages_missing")
+        return []
+
+    headers=_esselunga_headers()
+    try:
+        r=_esselunga_get(image_url,timeout=8,attempts=1,headers=headers)
+        if not r.ok:
+            print(f"[ESSELUNGA] OCR_FETCH_FAIL page={page_no:04d} status={r.status_code}")
+            return []
+
+        img=Image.open(BytesIO(r.content)).convert('L')
+
+        # Aumenta leggibilità senza ingrandimenti eccessivi.
+        w,h=img.size
+        scale=1.35 if max(w,h)<2200 else 1.0
+        if scale!=1.0:
+            img=img.resize((int(w*scale),int(h*scale)))
+
+        img=ImageOps.autocontrast(img)
+        img=ImageEnhance.Contrast(img).enhance(1.25)
+
+        try:
+            raw=pytesseract.image_to_string(
+                img,
+                lang='ita+eng',
+                config='--oem 3 --psm 11'
+            )
+        except Exception as first_err:
+            # Molte immagini Railway non hanno il language pack italiano.
+            try:
+                raw=pytesseract.image_to_string(
+                    img,
+                    lang='eng',
+                    config='--oem 3 --psm 11'
+                )
+            except Exception as e:
+                print(
+                    f"[ESSELUNGA] OCR_ERROR page={page_no:04d} "
+                    f"error={str(e)[:180]} first={str(first_err)[:100]}"
+                )
+                return []
+
+        clean=(raw or '').strip()
+        print(
+            f"[ESSELUNGA] OCR_PAGE page={page_no:04d} "
+            f"chars={len(clean)} image={w}x{h}"
+        )
+        if len(clean)<15:
+            return []
+
+        rows=_extract_offer_rows_from_text(clean,image_url,validity)
+        for x in rows:
+            x['page']=page_no
+            x['image_url']=image_url
+
+        print(
+            f"[ESSELUNGA] OCR_OFFERS page={page_no:04d} "
+            f"offers={len(rows)}"
+        )
+        return rows
+
+    except Exception as e:
+        print(
+            f"[ESSELUNGA] OCR_FATAL page={page_no:04d} "
+            f"error={str(e)[:180]}"
+        )
+        return []
+
+
+def _ocr_flippingbook_pages(page_images, validity='', max_pages=12):
+    """OCR progressivo e limitato per non appesantire Railway."""
+    all_rows=[]
+    for idx,u in enumerate(page_images[:max_pages],start=1):
+        rows=_ocr_esselunga_page(u,idx,validity)
+        all_rows.extend(rows)
+        # Se abbiamo già un buon numero di offerte, fermiamoci.
+        if len(all_rows)>=40:
+            break
+
+    out=[]
+    seen=set()
+    for x in all_rows:
+        k=(x.get('title','').lower(),x.get('price'),x.get('discount_pct'))
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(x)
+
+    print(
+        f"[ESSELUNGA] OCR_DONE pages={min(len(page_images),max_pages)} "
+        f"offers={len(out)}"
+    )
+    return out[:80]
+
+
 def _extract_offer_rows_from_flipbook(viewer_url, validity=''):
     """Legge il viewer Esselunga seguendo gli asset reali del FlippingBook."""
     headers=_esselunga_headers()
@@ -787,6 +892,11 @@ def _extract_offer_rows_from_flipbook(viewer_url, validity=''):
             f"[ESSELUNGA] IMAGE_PAGES_READY count={len(page_images)} "
             f"sample={page_images[:3]}"
         )
+
+        ocr_rows=_ocr_flippingbook_pages(page_images,validity,max_pages=12)
+        if ocr_rows:
+            print(f"[ESSELUNGA] OCR_HANDOFF offers={len(ocr_rows)}")
+            return ocr_rows
 
     rows=[]
     visited=set()
