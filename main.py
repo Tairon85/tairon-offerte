@@ -13,7 +13,7 @@ import requests
 from pypdf import PdfReader
 
 APP_NAME="Tairon Offerte"
-VERSION="1.3.3-live"
+VERSION="1.3.4-live"
 ROOT=Path(__file__).resolve().parent
 DB_PATH=ROOT/"tairon_offerte.db"
 
@@ -1106,8 +1106,26 @@ async def scanner_loop():
 @asynccontextmanager
 async def lifespan(app:FastAPI):
     global scanner_task
-    init_db(); cleanup_demo_rows(); await scan_once(); scanner_task=asyncio.create_task(scanner_loop()); yield; stop_event.set()
-    if scanner_task: await scanner_task
+    # FIX 1.3.4:
+    # il server deve diventare disponibile subito. La scansione Esselunga può
+    # richiedere decine di secondi e non deve bloccare lo startup di Uvicorn.
+    init_db()
+    cleanup_demo_rows()
+
+    stop_event.clear()
+    scanner_task = asyncio.create_task(scanner_loop())
+
+    print('[STARTUP] API_READY scanner_started_in_background=true')
+    yield
+
+    stop_event.set()
+    if scanner_task:
+        try:
+            await asyncio.wait_for(scanner_task, timeout=5)
+        except asyncio.TimeoutError:
+            scanner_task.cancel()
+        except asyncio.CancelledError:
+            pass
 
 app=FastAPI(title=APP_NAME,version=VERSION,lifespan=lifespan)
 class SettingsIn(BaseModel):
