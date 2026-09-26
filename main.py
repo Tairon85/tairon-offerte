@@ -2,7 +2,7 @@ from __future__ import annotations
 import asyncio, base64, json, os, random, sqlite3, html as html_lib, re
 from io import BytesIO
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from urllib.parse import urljoin
 from statistics import mean
@@ -20,7 +20,7 @@ except Exception:
     OCR_IMPORT_OK=False
 
 APP_NAME="Tairon Offerte"
-VERSION="1.4.2-live"
+VERSION="1.4.3-live"
 ROOT=Path(__file__).resolve().parent
 DB_PATH=ROOT/"tairon_offerte.db"
 
