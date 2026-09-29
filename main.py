@@ -21,7 +21,7 @@ except Exception:
     OCR_IMPORT_OK=False
 
 APP_NAME="Tairon Offerte"
-VERSION="1.5.0-live"
+VERSION="1.5.1-live"
 ROOT=Path(__file__).resolve().parent
 # 1.4.5: usa un volume Railway montato in /data quando presente.
 # Senza volume mantiene il fallback locale per non bloccare l'app.
@@ -1133,11 +1133,83 @@ def _spatial_title(tokens, anchor, crop):
         title=title[:72].rsplit(' ',1)[0]
     return title.title() if title.isupper() else title
 
+
+def _norm_words(s):
+    s=re.sub(r'[^A-Za-zÀ-ÿ0-9 ]+',' ',str(s or '')).upper()
+    return [w for w in s.split() if len(w)>=3 and w not in {
+        'PER','CON','DEL','DELLA','DELLO','DEI','GLI','UNA','UNO','THE',
+        'FRESCHI','SURGELATI','OFFERTA','PREZZO','PREZZI','SCONTO','FIDATY'
+    }]
+
+def _find_title_anchor(tokens, title):
+    """Trova dove compare davvero il titolo del prodotto nella pagina."""
+    words=_norm_words(title)
+    if not words:
+        return None
+
+    best=None
+    # Cerca finestre OCR vicine verticalmente/orizzontalmente.
+    for i,t in enumerate(tokens):
+        base=t['text'].upper()
+        score=sum(1 for w in words if w in base)
+        if score==0:
+            continue
+        group=[t]
+        for u in tokens[max(0,i-5):min(len(tokens),i+8)]:
+            if abs(u['cy']-t['cy'])<0.055 and abs(u['cx']-t['cx'])<0.28:
+                group.append(u)
+        blob=' '.join(x['text'] for x in group).upper()
+        hits=sum(1 for w in words if w in blob)
+        ratio=hits/max(1,len(words))
+        if hits>=1:
+            val=(ratio,hits,-abs(t['cx']-0.5))
+            if best is None or val>best[0]:
+                best=(val,{
+                    'cx':sum(x['cx'] for x in group)/len(group),
+                    'cy':sum(x['cy'] for x in group)/len(group),
+                    'text':blob
+                })
+    return best[1] if best else None
+
+def _price_box_is_unit_price(box, tokens):
+    """Esclude prezzi tipo '(€ 26,60 al kg)' o '(€ 8,32 al kg)'."""
+    bx,by=box['cx'],box['cy']
+    nearby=[]
+    for t in tokens:
+        if abs(t['cy']-by)<0.025 and abs(t['cx']-bx)<0.20:
+            nearby.append(t['text'].upper())
+    blob=' '.join(nearby)
+    return any(k in blob for k in ('AL KG','AL LITRO','AL LT','AL PZ','/KG','/L'))
+
+def _nearest_price_below_title(anchor, boxes, tokens, used):
+    """Prezzo principale vicino e sotto al nome prodotto nello stesso blocco."""
+    candidates=[]
+    ax,ay=anchor['cx'],anchor['cy']
+    for j,b in enumerate(boxes):
+        if j in used:
+            continue
+        if _price_box_is_unit_price(b,tokens):
+            continue
+        dx=abs(b['cx']-ax)
+        dy=b['cy']-ay
+        # stesso blocco: prezzo tipicamente poco sotto il titolo
+        if dx<=0.20 and 0.00<=dy<=0.28:
+            p=float(b['price'])
+            if 0.05 <= p <= 500:
+                score=dy + dx*0.7
+                candidates.append((score,j,b))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda z:z[0])
+    return candidates[0]
+
 def _attach_offer_crops(rows, processed_img, source_url):
     """
-    1.5.0: associa immagine, titolo e prezzo per coordinate OCR.
-    Mai più titolo di un prodotto con la foto di un altro quando abbiamo
-    un'ancora prezzo affidabile nella stessa zona.
+    1.5.1:
+    - prima localizza il NOME prodotto sulla pagina
+    - poi cerca il prezzo principale sotto allo stesso nome
+    - ignora prezzi/kg
+    - crop centrato sul blocco reale prodotto
     """
     if not rows:
         return rows
@@ -1149,124 +1221,111 @@ def _attach_offer_crops(rows, processed_img, source_url):
         print(f"[ESSELUNGA] SPATIAL_OCR_ERROR error={str(e)[:120]}")
         tokens=[]; boxes=[]
 
-    generic_titles={
-        'prezzi','prezzo','prezzi corti','prezzo speciale','freschi','surgelati',
-        'offerte','offerta','speciale','supermercato','esselunga','offerta esselunga'
-    }
-
     used=set()
-    exact=0
-    spatial=0
+    title_bound=0
+    price_bound=0
     fallback=0
-    cols=3
-    n=len(rows)
-    grid_rows=max(1,math.ceil(n/cols))
-    top_margin=0.07
-    usable_h=0.90
-    cell_h=usable_h/grid_rows
 
     for i,row in enumerate(rows):
-        target=None
-        try:
-            target=round(float(row.get('price')),2)
-        except Exception:
-            pass
+        title=str(row.get('title') or '').strip()
+        title_anchor=_find_title_anchor(tokens,title)
 
         hit=None
+        anchor=None
 
-        # 1) stesso prezzo OCR: associazione più affidabile.
-        if target is not None:
-            matches=[]
-            for j,b in enumerate(boxes):
-                if j in used:
-                    continue
-                delta=abs(float(b['price'])-target)
-                if delta <= 0.031:
-                    matches.append((delta,j,b))
-            if matches:
-                matches.sort(key=lambda z:(z[0],z[2]['top'],z[2]['left']))
-                _,hit,b=matches[0]
-                exact+=1
+        # 1) MIGLIORE: titolo fisicamente trovato -> prezzo sotto nello stesso blocco.
+        if title_anchor is not None:
+            q=_nearest_price_below_title(title_anchor,boxes,tokens,used)
+            if q is not None:
+                _,hit,b=q
+                anchor=b
+                title_bound+=1
 
-        # 2) se il parser testuale ha sbagliato il prezzo, usa la zona grafica
-        # corrispondente all'ordine della promo e scegli il prezzo OCR locale.
+        # 2) Fallback: prezzo parser, ma MAI prezzo al kg.
         if hit is None:
-            c=i % cols
-            r=i // cols
-            gx=c/cols
-            gy=top_margin+r*cell_h
-            gw=1/cols
-            gh=max(0.18,min(0.30,cell_h*1.18))
-            local=[]
-            for j,bx in enumerate(boxes):
-                if j in used:
-                    continue
-                if gx <= bx['cx'] <= gx+gw and gy <= bx['cy'] <= min(1.0,gy+gh):
-                    center_dist=abs(bx['cx']-(gx+gw/2))+abs(bx['cy']-(gy+gh*0.68))
-                    local.append((center_dist,j,bx))
-            if local:
-                local.sort(key=lambda z:z[0])
-                _,hit,b=local[0]
-                spatial+=1
+            try:
+                target=round(float(row.get('price')),2)
+            except Exception:
+                target=None
+            if target is not None:
+                matches=[]
+                for j,b in enumerate(boxes):
+                    if j in used or _price_box_is_unit_price(b,tokens):
+                        continue
+                    delta=abs(float(b['price'])-target)
+                    if delta<=0.031:
+                        matches.append((delta,j,b))
+                if matches:
+                    matches.sort(key=lambda z:(z[0],z[2]['top'],z[2]['left']))
+                    _,hit,b=matches[0]
+                    anchor=b
+                    price_bound+=1
 
         if hit is not None:
             used.add(hit)
-            # Crop centrato sulla stessa promo del prezzo.
-            cw=0.32
-            ch=0.275
-            x=max(0.0,min(1.0-cw,b['cx']-cw/2))
-            y=max(0.0,min(1.0-ch,b['cy']-ch*0.76))
+            b=anchor
 
-            # Prezzo e titolo vengono dalla STESSA zona dell'immagine.
+            # Volantino Esselunga: blocchi principalmente a 2 colonne.
+            # Il crop resta nella metà corretta della pagina e non invade il prodotto sopra/sotto.
+            half=0 if b['cx']<0.5 else 1
+            x=0.015 if half==0 else 0.505
+            cw=0.48
+
+            # Se abbiamo il titolo, parte appena sopra il titolo e termina sotto il prezzo.
+            if title_anchor is not None:
+                y=max(0.0,title_anchor['cy']-0.065)
+                bottom=min(0.995,b['cy']+0.105)
+                ch=max(0.19,min(0.34,bottom-y))
+            else:
+                y=max(0.0,b['cy']-0.20)
+                ch=0.29
+
+            if y+ch>0.995:
+                ch=0.995-y
+
+            # prezzo corrente = prezzo principale nello stesso blocco
             try:
-                local_price=round(float(b['price']),2)
-                if 0.05 <= local_price <= 500:
-                    old_price=row.get('price')
-                    if old_price and abs(float(old_price)-local_price)>0.03:
-                        print(f"[ESSELUNGA] SPATIAL_PRICE_FIX old={old_price} new={local_price}")
-                    row['price']=local_price
+                new_price=round(float(b['price']),2)
+                old=row.get('price')
+                if old is not None and abs(float(old)-new_price)>0.03:
+                    print(f"[ESSELUNGA] TITLE_PRICE_FIX title={title[:35]} old={old} new={new_price}")
+                row['price']=new_price
             except Exception:
                 pass
 
-            local_title=_spatial_title(tokens,b,(x,y,cw,ch))
-            if local_title:
-                old_title=str(row.get('title') or '')
-                if old_title.lower()!=local_title.lower():
-                    print(f"[ESSELUNGA] SPATIAL_TITLE_FIX old={old_title[:45]} new={local_title[:45]}")
-                row['title']=local_title
+            # Tieni il titolo parser solo se abbiamo verificato che esiste davvero dentro questa zona.
+            if title_anchor is None:
+                local_title=_spatial_title(tokens,b,(x,y,cw,ch))
+                if local_title:
+                    row['title']=local_title
 
         else:
-            # Nessuna associazione spaziale sicura: meglio una crop neutra
-            # che mostrare deliberatamente un altro prodotto.
-            c=i % cols
-            r=i // cols
-            x=c/cols+0.012
-            y=top_margin+r*cell_h
-            cw=(1/cols)-0.024
-            ch=max(0.18,min(0.25,cell_h))
-            if y+ch>0.99:
-                y=max(0.0,0.99-ch)
+            # Nessun legame affidabile: niente crop di un prodotto a caso.
+            # Mostra una zona neutra della pagina nella metà coerente, senza inventare associazioni.
+            half=i % 2
+            x=0.015 if half==0 else 0.505
+            cw=0.48
+            band=(i//2)%4
+            y=0.05 + band*0.225
+            ch=0.21
             fallback+=1
-
-            title=str(row.get('title') or '').strip()
-            if title.lower() in generic_titles or len(title)<4:
-                row['title']='Offerta Esselunga'
+            row['title']=title or 'Offerta Esselunga'
 
         row['image_url']="/api/offer-image?src="+quote(source_url,safe='')+f"&x={x:.4f}&y={y:.4f}&w={cw:.4f}&h={ch:.4f}"
 
-        # Se prezzo originale non è credibile, non mostrare falsi sconti.
+        # Vecchio prezzo: se palesemente errato/unitario, non mostrarlo.
         try:
             cur=float(row.get('price') or 0)
             orig=float(row.get('original_price') or 0)
-            if cur>0 and orig>0 and (orig/cur>=4.0 or orig<=cur):
+            if cur>0 and orig>0 and (orig/cur>=3.5 or orig<=cur):
                 row['original_price']=None
                 row['discount_pct']=None
         except Exception:
             pass
 
     print(
-        f"[ESSELUNGA] SPATIAL_BIND offers={len(rows)} "
-        f"exact={exact} spatial={spatial} fallback={fallback}"
+        f"[ESSELUNGA] TITLE_BIND offers={len(rows)} "
+        f"title_bound={title_bound} price_bound={price_bound} fallback={fallback}"
     )
     return rows
 
