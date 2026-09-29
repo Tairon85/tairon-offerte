@@ -21,7 +21,7 @@ except Exception:
     OCR_IMPORT_OK=False
 
 APP_NAME="Tairon Offerte"
-VERSION="1.4.9-live"
+VERSION="1.5.0-live"
 ROOT=Path(__file__).resolve().parent
 # 1.4.5: usa un volume Railway montato in /data quando presente.
 # Senza volume mantiene il fallback locale per non bloccare l'app.
@@ -1037,29 +1037,132 @@ def _ocr_price_boxes(img):
     out.sort(key=lambda z:(z['top'],z['left']))
     return out
 
+
+def _ocr_layout_tokens(img):
+    """Token OCR con coordinate: usati per tenere foto, titolo e prezzo nella stessa zona."""
+    if not OCR_IMPORT_OK:
+        return []
+    data=None
+    for lang in ('ita+eng','eng'):
+        try:
+            data=pytesseract.image_to_data(
+                img,lang=lang,config='--oem 3 --psm 11',
+                output_type=pytesseract.Output.DICT
+            )
+            break
+        except Exception:
+            data=None
+    if not data:
+        return []
+    W,H=img.size
+    out=[]
+    n=len(data.get('text',[]))
+    for i in range(n):
+        t=(data['text'][i] or '').strip()
+        if not t:
+            continue
+        try:
+            conf=float(data.get('conf',['0']*n)[i])
+        except Exception:
+            conf=0
+        if conf < 18:
+            continue
+        l=int(data['left'][i]); top=int(data['top'][i])
+        w=int(data['width'][i]); h=int(data['height'][i])
+        out.append({
+            'text':t,'left':l,'top':top,'width':w,'height':h,
+            'cx':(l+w/2)/max(W,1),'cy':(top+h/2)/max(H,1),
+            'line':(
+                data.get('block_num',[0]*n)[i],
+                data.get('par_num',[0]*n)[i],
+                data.get('line_num',[0]*n)[i]
+            )
+        })
+    return out
+
+def _spatial_title(tokens, anchor, crop):
+    """Trova il nome prodotto vicino al prezzo/centro della stessa promo."""
+    x,y,w,h=crop
+    ax=anchor.get('cx',x+w/2)
+    ay=anchor.get('cy',y+h*0.68)
+
+    noise=(
+        'SCONTO','FIDATY','PREZZO','SPECIALE','OFFERTA','RISPARMIO',
+        'AL KG','AL LITRO','AL PZ','€','EUR','ESSELUNGA','VALIDO',
+        'FRESCHI','SURGELATI','CARTE FIDATY'
+    )
+
+    # Raggruppa per riga solo token nella stessa area, preferendo testo sopra il prezzo.
+    lines={}
+    for t in tokens:
+        cx,cy=t['cx'],t['cy']
+        if not (x <= cx <= x+w and y <= cy <= y+h):
+            continue
+        if cy > ay + 0.045:
+            continue
+        if abs(cx-ax) > max(0.18,w*0.72):
+            continue
+        lines.setdefault(t['line'],[]).append(t)
+
+    candidates=[]
+    for parts in lines.values():
+        parts=sorted(parts,key=lambda z:z['left'])
+        s=' '.join(p['text'] for p in parts).strip()
+        up=s.upper()
+        letters=sum(c.isalpha() for c in s)
+        digits=sum(c.isdigit() for c in s)
+        if len(s)<4 or letters<4 or digits>letters:
+            continue
+        if any(n in up for n in noise):
+            continue
+        if '%' in s or re.search(r'\d+[,.]\d{2}',s):
+            continue
+        cy=sum(p['cy'] for p in parts)/len(parts)
+        # Vicino e sopra il prezzo è meglio; mai prendere testo troppo lontano.
+        dist=max(0,ay-cy)
+        score=letters - dist*85
+        if s.isupper():
+            score+=8
+        candidates.append((score,s))
+
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    title=re.sub(r'\s+',' ',candidates[0][1]).strip(' -·|:;,.')
+    if len(title)>72:
+        title=title[:72].rsplit(' ',1)[0]
+    return title.title() if title.isupper() else title
+
 def _attach_offer_crops(rows, processed_img, source_url):
-    """1.4.7: crop più stretto; fallback a celle del volantino per evitare pagine intere."""
+    """
+    1.5.0: associa immagine, titolo e prezzo per coordinate OCR.
+    Mai più titolo di un prodotto con la foto di un altro quando abbiamo
+    un'ancora prezzo affidabile nella stessa zona.
+    """
     if not rows:
         return rows
+
     try:
+        tokens=_ocr_layout_tokens(processed_img)
         boxes=_ocr_price_boxes(processed_img)
     except Exception as e:
-        print(f"[ESSELUNGA] CROP_OCR_ERROR error={str(e)[:120]}")
-        boxes=[]
+        print(f"[ESSELUNGA] SPATIAL_OCR_ERROR error={str(e)[:120]}")
+        tokens=[]; boxes=[]
 
     generic_titles={
         'prezzi','prezzo','prezzi corti','prezzo speciale','freschi','surgelati',
-        'offerte','offerta','speciale','supermercato','esselunga'
+        'offerte','offerta','speciale','supermercato','esselunga','offerta esselunga'
     }
 
     used=set()
     exact=0
+    spatial=0
     fallback=0
     cols=3
     n=len(rows)
-    grid_rows=max(1, math.ceil(n/cols))
-    top_margin=0.08
-    usable_h=0.88
+    grid_rows=max(1,math.ceil(n/cols))
+    top_margin=0.07
+    usable_h=0.90
     cell_h=usable_h/grid_rows
 
     for i,row in enumerate(rows):
@@ -1070,50 +1173,101 @@ def _attach_offer_crops(rows, processed_img, source_url):
             pass
 
         hit=None
+
+        # 1) stesso prezzo OCR: associazione più affidabile.
         if target is not None:
+            matches=[]
             for j,b in enumerate(boxes):
                 if j in used:
                     continue
-                if abs(float(b['price'])-target) <= 0.021:
-                    hit=j
-                    break
+                delta=abs(float(b['price'])-target)
+                if delta <= 0.031:
+                    matches.append((delta,j,b))
+            if matches:
+                matches.sort(key=lambda z:(z[0],z[2]['top'],z[2]['left']))
+                _,hit,b=matches[0]
+                exact+=1
+
+        # 2) se il parser testuale ha sbagliato il prezzo, usa la zona grafica
+        # corrispondente all'ordine della promo e scegli il prezzo OCR locale.
+        if hit is None:
+            c=i % cols
+            r=i // cols
+            gx=c/cols
+            gy=top_margin+r*cell_h
+            gw=1/cols
+            gh=max(0.18,min(0.30,cell_h*1.18))
+            local=[]
+            for j,bx in enumerate(boxes):
+                if j in used:
+                    continue
+                if gx <= bx['cx'] <= gx+gw and gy <= bx['cy'] <= min(1.0,gy+gh):
+                    center_dist=abs(bx['cx']-(gx+gw/2))+abs(bx['cy']-(gy+gh*0.68))
+                    local.append((center_dist,j,bx))
+            if local:
+                local.sort(key=lambda z:z[0])
+                _,hit,b=local[0]
+                spatial+=1
 
         if hit is not None:
             used.add(hit)
-            b=boxes[hit]
-            cw=0.31
-            ch=0.25
+            # Crop centrato sulla stessa promo del prezzo.
+            cw=0.32
+            ch=0.275
             x=max(0.0,min(1.0-cw,b['cx']-cw/2))
-            y=max(0.0,min(1.0-ch,b['cy']-ch*0.72))
-            exact+=1
+            y=max(0.0,min(1.0-ch,b['cy']-ch*0.76))
+
+            # Prezzo e titolo vengono dalla STESSA zona dell'immagine.
+            try:
+                local_price=round(float(b['price']),2)
+                if 0.05 <= local_price <= 500:
+                    old_price=row.get('price')
+                    if old_price and abs(float(old_price)-local_price)>0.03:
+                        print(f"[ESSELUNGA] SPATIAL_PRICE_FIX old={old_price} new={local_price}")
+                    row['price']=local_price
+            except Exception:
+                pass
+
+            local_title=_spatial_title(tokens,b,(x,y,cw,ch))
+            if local_title:
+                old_title=str(row.get('title') or '')
+                if old_title.lower()!=local_title.lower():
+                    print(f"[ESSELUNGA] SPATIAL_TITLE_FIX old={old_title[:45]} new={local_title[:45]}")
+                row['title']=local_title
+
         else:
+            # Nessuna associazione spaziale sicura: meglio una crop neutra
+            # che mostrare deliberatamente un altro prodotto.
             c=i % cols
             r=i // cols
-            x=c/cols + 0.008
-            y=top_margin + r*cell_h
-            cw=(1/cols)-0.016
-            ch=max(0.18,min(0.28,cell_h*1.08))
+            x=c/cols+0.012
+            y=top_margin+r*cell_h
+            cw=(1/cols)-0.024
+            ch=max(0.18,min(0.25,cell_h))
             if y+ch>0.99:
                 y=max(0.0,0.99-ch)
             fallback+=1
 
+            title=str(row.get('title') or '').strip()
+            if title.lower() in generic_titles or len(title)<4:
+                row['title']='Offerta Esselunga'
+
         row['image_url']="/api/offer-image?src="+quote(source_url,safe='')+f"&x={x:.4f}&y={y:.4f}&w={cw:.4f}&h={ch:.4f}"
 
-        title=str(row.get('title') or '').strip()
-        if title.lower() in generic_titles or len(title) < 4:
-            row['title']='Offerta Esselunga'
-
-        # Evita falsi sconti causati dal prezzo al kg / prezzi vicini nel volantino.
+        # Se prezzo originale non è credibile, non mostrare falsi sconti.
         try:
             cur=float(row.get('price') or 0)
             orig=float(row.get('original_price') or 0)
-            if cur>0 and orig>0 and orig/cur >= 4.0:
+            if cur>0 and orig>0 and (orig/cur>=4.0 or orig<=cur):
                 row['original_price']=None
                 row['discount_pct']=None
         except Exception:
             pass
 
-    print(f"[ESSELUNGA] CROP_MATCH offers={len(rows)} exact={exact} fallback={fallback}")
+    print(
+        f"[ESSELUNGA] SPATIAL_BIND offers={len(rows)} "
+        f"exact={exact} spatial={spatial} fallback={fallback}"
+    )
     return rows
 
 def _ocr_esselunga_page(image_url, page_no, validity=''):
